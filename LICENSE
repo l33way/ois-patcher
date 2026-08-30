@@ -5,8 +5,9 @@ This work is licensed under the Creative Commons
 Attribution-NonCommercial 4.0 International License (CC BY-NC 4.0).
 
 You are free to:
-  - Share -- copy and redistribute this patcher (the script, this
-    repository, and the bundled mod files) in any medium or format
+  - Share -- copy and redistribute this repository (the patcher script,
+    the data-fix generator, and this documentation) in any medium or
+    format
   - Adapt -- remix, transform, and build upon it
 
 Under the following terms:
@@ -20,11 +21,15 @@ Under the following terms:
     technological measures that legally restrict others from doing
     anything this license permits.
 
-No warranties are given. This license does not cover the underlying
-game, "Objects in Space" by Flat Earth Games, which is unaffected and
-remains the property of its own copyright holders -- this license
-applies only to the patcher script, its documentation, and the
-data-only mod files in this repository.
+No warranties are given. This license covers only the original
+material in this repository -- the patcher script (ois_patcher.py),
+the data-fix generator (apply_data_fixes.py), this mod's own metadata
+(modinfo.txt), and the documentation. It does not cover, and makes no
+claim over, "Objects in Space" itself or any of Flat Earth Games' own
+asset files -- including the files apply_data_fixes.py reconstructs at
+install time by reading and modifying your own copy of the game. That
+content remains Flat Earth Games' property throughout; this project
+never distributes it, and this license grants no rights to it.
 
 Full legal text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
 Human-readable summary: https://creativecommons.org/licenses/by-nc/4.0/
