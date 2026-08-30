@@ -1,0 +1,65 @@
+name: Release on merge to master
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read PATCHER_VERSION from ois_patcher.py
+        id: version
+        run: |
+          raw=$(grep -oP '^PATCHER_VERSION\s*=\s*"\K[^"]+' ois_patcher.py)
+          if [ -z "$raw" ]; then
+            echo "Could not find PATCHER_VERSION in ois_patcher.py" >&2
+            exit 1
+          fi
+          echo "PATCHER_VERSION: $raw"
+          echo "version=v${raw}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version was already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.version }} already exists -- PATCHER_VERSION wasn't bumped in this merge, skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Build zip package
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          staging="oisbugfix-patcher-${version}"
+          mkdir "$staging"
+          cp README.md LICENSE ois_patcher.py apply_data_fixes.py "$staging"/
+          cp -r mod "$staging"/
+          zip -r "${staging}.zip" "$staging"
+          echo "zip_name=${staging}.zip" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        if: steps.check.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: ${{ env.zip_name }}
