@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Objects in Space (Flat Earth Games) -- unofficial client-side bugfix
-patcher for ois.exe.
+Objects in Space (Flat Earth Games) -- unofficial bugfix patcher for
+ois.exe (client) and ois_server.exe, which ships alongside it in every
+Windows Steam install (needed for hosting or joining co-op games --
+singleplayer never touches it).
 
 A collection of verified fixes for the game, consolidated into one
 script anyone can point at their own copy of the game. Also installs a
@@ -61,6 +63,14 @@ Applies (all client-only, ois.exe):
     engine DLL, this ignores the "open PDA" input for that instant
     instead -- pressing it again immediately after works normally.
 
+Applies to ois_server.exe (ships alongside ois.exe in every Windows
+Steam install):
+  - Both halves of the same Pirate Hunt crash as above -- ois.exe and
+    ois_server.exe both compile the same vulnerable function, at
+    different addresses. Patched separately (own backup, own .ptch
+    section); skipped quietly in the rare case it's genuinely missing
+    (e.g. a modified install).
+
 Every patch site's original bytes are verified before being touched; if
 they don't match (wrong game version, already patched, modded some
 other way), the affected patch is skipped with a warning rather than
@@ -89,6 +99,8 @@ import apply_data_fixes
 IMAGE_BASE = 0x400000
 FIXES_APPLIED = []
 FIXES_SKIPPED = []
+SERVER_FIXES_APPLIED = []
+SERVER_FIXES_SKIPPED = []
 
 # Bumped on every release that changes what gets patched -- embedded into
 # the patched exe itself (see VERSION_MARKER_* below) so a later run of
@@ -96,7 +108,7 @@ FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.2.0"
+PATCHER_VERSION = "0.3.1"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
@@ -334,6 +346,24 @@ def fix_pirate_hunt(data, pe, ptch_va, ptch_off, cave_cursor):
     print(f"  [OK] {label}")
     FIXES_APPLIED.append(label)
     return cave_cursor + len(cave)
+
+
+def fix_pirate_hunt_format_string(data, pe):
+    label = "Pirate Hunt crash guard #2 (\"duplicate ship-sets\" log call missing an argument)"
+    STRING_VA = 0x5e4620
+    ORIGINAL = b"%s duplicate ship-sets that need spawning."
+    REPLACEMENT = b"Duplicate ship-sets need spawning."
+
+    off = verify_site(data, pe, STRING_VA, ORIGINAL, label)
+    if off is None:
+        FIXES_SKIPPED.append(label)
+        return
+
+    padded = REPLACEMENT + b"\x00" * (len(ORIGINAL) - len(REPLACEMENT))
+    data[off:off + len(ORIGINAL)] = padded
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
 
 
 # ============================================================
@@ -959,6 +989,150 @@ def fix_del_command(data, pe, ptch_va, ptch_off, cave_cursor):
 
 
 # ============================================================
+# Fix 9: Pirate Hunt spawn-selection bounds-check guard -- ois_server.exe
+# copy of the same bug as fix_pirate_hunt above. ois.exe and ois_server.exe
+# both compile GameLogic::resetShipsInScenario; the missing bounds-check
+# exists in both binaries at different absolute addresses. Singleplayer
+# never touches ois_server.exe (confirmed live -- only ois.exe runs), so
+# this only matters for anyone hosting or joining a co-op game, where
+# ois_server.exe runs as its own real process. Patched separately from
+# ois.exe's fixes above -- own backup, own .ptch section, own version
+# marker -- since it's a completely different binary.
+# ============================================================
+
+def fix_pirate_hunt_server(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Pirate Hunt crash guard (server)"
+    PATCH_SITE_VA, RESUME_VA, LOOP_EXIT_VA = 0x00408947, 0x0040894d, 0x004089d3
+    ERROR_STR_VA, CATEGORY_VA, LOG_FUNC_VA = 0x5e2478, 0x5cdc34, 0x00591070
+
+    expected = bytes([0x8D, 0x04, 0x76, 0x8B, 0x55, 0xA4])
+    off = verify_site(data, pe, PATCH_SITE_VA, expected, label)
+    if off is None:
+        SERVER_FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    cave = bytearray()
+    def emit(b): cave.extend(b)
+
+    emit(bytes([0x83, 0xFE, 0xFF]))
+    jnz_pos = len(cave)
+    emit(bytes([0x0F, 0x85, 0, 0, 0, 0]))
+    call_pos = len(cave)
+    emit(bytes([0xE8, 0, 0, 0, 0]))
+    next_offset = len(cave)
+    emit(bytes([0x5B]))
+    lea1_pos = len(cave)
+    emit(bytes([0x8D, 0x83, 0, 0, 0, 0]))
+    emit(bytes([0x50]))
+    lea2_pos = len(cave)
+    emit(bytes([0x8D, 0x83, 0, 0, 0, 0]))
+    emit(bytes([0x50]))
+    call2_pos = len(cave)
+    emit(bytes([0xE8, 0, 0, 0, 0]))
+    emit(bytes([0x83, 0xC4, 0x08]))
+    jmp1_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))
+    resume_pos = len(cave)
+    emit(bytes([0x8D, 0x04, 0x76]))
+    emit(bytes([0x8B, 0x55, 0xA4]))
+    jmp2_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))
+
+    cave_va = ptch_va + cave_cursor
+    next_va = cave_va + next_offset
+
+    struct.pack_into("<i", cave, jnz_pos + 2, (cave_va + resume_pos) - (cave_va + jnz_pos + 6))
+    struct.pack_into("<i", cave, lea1_pos + 2, ERROR_STR_VA - next_va)
+    struct.pack_into("<i", cave, lea2_pos + 2, CATEGORY_VA - next_va)
+    struct.pack_into("<i", cave, call2_pos + 1, LOG_FUNC_VA - (cave_va + call2_pos + 5))
+    struct.pack_into("<i", cave, jmp1_pos + 1, LOOP_EXIT_VA - (cave_va + jmp1_pos + 5))
+    struct.pack_into("<i", cave, jmp2_pos + 1, RESUME_VA - (cave_va + jmp2_pos + 5))
+    struct.pack_into("<i", cave, call_pos + 1, 0)
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+
+    redirect = bytearray([0xE9, 0, 0, 0, 0, 0x90])
+    struct.pack_into("<i", redirect, 1, cave_va - (PATCH_SITE_VA + 5))
+    data[off:off + 6] = redirect
+
+    print(f"  [OK] {label}")
+    SERVER_FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+def fix_pirate_hunt_format_string_server(data, pe):
+    label = "Pirate Hunt crash guard #2, server (\"duplicate ship-sets\" log call missing an argument)"
+    STRING_VA = 0x5e24a8
+    ORIGINAL = b"%s duplicate ship-sets that need spawning."
+    REPLACEMENT = b"Duplicate ship-sets need spawning."
+
+    off = verify_site(data, pe, STRING_VA, ORIGINAL, label)
+    if off is None:
+        SERVER_FIXES_SKIPPED.append(label)
+        return
+
+    padded = REPLACEMENT + b"\x00" * (len(ORIGINAL) - len(REPLACEMENT))
+    data[off:off + len(ORIGINAL)] = padded
+
+    print(f"  [OK] {label}")
+    SERVER_FIXES_APPLIED.append(label)
+
+
+def patch_server_exe(exe_path):
+    """Patches ois_server.exe, which ships alongside ois.exe in every
+    Windows Steam install -- separate file, separate backup, separate
+    .ptch section. Skips quietly (not an error) in the rare case it's
+    genuinely missing (e.g. a modified install)."""
+    server_path = exe_path.parent / "ois_server.exe"
+    if not server_path.is_file():
+        print(f"\n[SKIP] ois_server.exe not found next to {exe_path.name} -- skipping server-side fixes "
+              f"(only matters for hosting/joining co-op games).")
+        return False
+
+    backup_path = server_path.with_name(server_path.name + ".original-backup")
+    if backup_path.exists():
+        print(f"\nServer backup already exists at {backup_path} -- not overwriting it.")
+    else:
+        backup_path.write_bytes(server_path.read_bytes())
+        print(f"\nBacked up original server exe to {backup_path}")
+
+    data = bytearray(server_path.read_bytes())
+
+    pe_check = load_pe(data)
+    if pe_check.OPTIONAL_HEADER.ImageBase != IMAGE_BASE:
+        pe_check.close()
+        print(f"Unexpected ImageBase {hex(pe_check.OPTIONAL_HEADER.ImageBase)} in ois_server.exe -- skipping.", file=sys.stderr)
+        return False
+    pe_check.close()
+
+    print("Adding patch section to ois_server.exe...")
+    try:
+        ptch_va, ptch_off, ptch_size = add_ptch_section(data)
+    except RuntimeError as e:
+        print(f"ois_server.exe: {e}")
+        return False
+
+    pe = load_pe(data)
+    pe.parse_data_directories()
+
+    print("Applying server-side fixes:")
+    cave_cursor = VERSION_MARKER_SIZE
+    cave_cursor = fix_pirate_hunt_server(data, pe, ptch_va, ptch_off, cave_cursor)
+    fix_pirate_hunt_format_string_server(data, pe)
+    pe.close()
+
+    if cave_cursor > ptch_size:
+        print(f"ERROR: server cave usage ({cave_cursor} bytes) exceeded reserved space ({ptch_size} bytes) -- "
+              f"aborting without writing ois_server.exe.", file=sys.stderr)
+        return False
+
+    server_path.write_bytes(data)
+    print(f"Applied {len(SERVER_FIXES_APPLIED)} server fix(es), skipped {len(SERVER_FIXES_SKIPPED)}.")
+    print(f"Patched: {server_path}")
+    return True
+
+
+# ============================================================
 # Data-only mod install (scenario typo, dead hair tokens, mesh typo --
 # see apply_data_fixes.py; generated from the user's own game files
 # rather than shipped as full copies, since those are Flat Earth
@@ -1042,6 +1216,7 @@ def main():
     print("\nApplying fixes:")
     cave_cursor = VERSION_MARKER_SIZE  # first bytes of the cave are reserved for the version marker
     cave_cursor = fix_pirate_hunt(data, pe, ptch_va, ptch_off, cave_cursor)
+    fix_pirate_hunt_format_string(data, pe)
     cave_cursor = fix_music_leak(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_burnvector_strict_compare(data, pe, ptch_va, ptch_off, cave_cursor)
     fix_burnvector_travelstate(data, pe)
@@ -1057,6 +1232,9 @@ def main():
 
     exe_path.write_bytes(data)
 
+    print("\nChecking for ois_server.exe (needed for hosting/joining co-op games)...")
+    server_patched = patch_server_exe(exe_path)
+
     print("\nInstalling data-only bugfix mod...")
     mod_installed = install_mod(exe_path)
 
@@ -1066,10 +1244,16 @@ def main():
         print("Skipped (likely a different game version, or already patched some other way):")
         for f in FIXES_SKIPPED:
             print(f"  - {f}")
+    if server_patched:
+        print(f"ois_server.exe: applied {len(SERVER_FIXES_APPLIED)} fix(es), skipped {len(SERVER_FIXES_SKIPPED)}.")
+    else:
+        print("ois_server.exe: not patched, see above (only matters for hosting/joining co-op games).")
     print(f"Bugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
     print(f"\nPatched: {exe_path}")
     print(f"Original backed up at: {backup_path}")
     print("To revert the exe: copy the .original-backup file back over ois.exe.")
+    if server_patched:
+        print("To revert ois_server.exe: copy its .original-backup file back over it.")
     if mod_installed:
         print("To remove the mod: delete the 'oisbugfix' folder from ObjectsInSpace/mods/.")
 
