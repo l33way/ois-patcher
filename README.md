@@ -8,8 +8,10 @@ crashes and one long-standing spam bug, and adds a small mail-terminal
 feature.
 
 This is a community patch, not an official release. Use at your own
-discretion — a backup of your original `ois.exe` is made automatically
-before anything is touched (see below).
+discretion — a backup of your original `ois.exe` and `ois_server.exe`
+(the co-op server binary, which ships alongside `ois.exe` in every
+Windows Steam install) is made automatically before anything is touched
+(see below).
 
 ## Why I built this
 
@@ -47,7 +49,8 @@ copy of Flat Earth Games' own content.
 
 ## What's in this folder
 
-- `ois_patcher.py` — patches your `ois.exe` and installs the bugfix mod
+- `ois_patcher.py` — patches your `ois.exe` and `ois_server.exe`, and
+  installs the bugfix mod
 - `apply_data_fixes.py` — generates the data-only fixes from your own
   `assets/` folder (see the file's own header for why they're not
   shipped as ready-made files)
@@ -73,29 +76,43 @@ to install the mod). It will:
    (created once — running the patcher again reuses the existing
    backup rather than overwriting it)
 2. Apply the binary fixes listed below, in place
-3. Install the `oisbugfix` mod into `ObjectsInSpace/mods/oisbugfix/`
+3. Back up and patch `ois_server.exe` the same way — it ships alongside
+   `ois.exe` in every Windows Steam install and is needed for
+   hosting/joining co-op games (singleplayer never runs it, but it's
+   still there). Its own separate backup, checked and skipped just as
+   safely if anything doesn't match. If it's genuinely missing (e.g. a
+   modified install), this step is skipped quietly rather than erroring.
+4. Install the `oisbugfix` mod into `ObjectsInSpace/mods/oisbugfix/`
 
 Every patch checks the exact bytes it's about to change first, and
 skips itself with a warning (rather than guessing) if anything doesn't
 match — a different game version, or a file already modified some other
 way. It's safe to re-run against an *unpatched* backup at any time.
 
-Running it against an `ois.exe` that's already been patched won't touch
-anything — it detects its own previous work and tells you exactly what's
-going on: if it's the same version, there's nothing to do; if it's an
-older version, it'll tell you to restore `ois.exe.original-backup` and
-re-run to pick up the newer fixes.
+Running it against an `ois.exe` (or `ois_server.exe`) that's already been
+patched won't touch anything — each binary independently detects its own
+previous work and tells you exactly what's going on: if it's the same
+version, there's nothing to do for that binary; if it's an older version,
+it'll tell you to restore that binary's own `.original-backup` and re-run
+to pick up the newer fixes.
 
 ### Reverting
 
-- **Exe:** copy `ois.exe.original-backup` back over `ois.exe`.
+- **Client exe:** copy `ois.exe.original-backup` back over `ois.exe`.
+- **Server exe:** if `ois_server.exe.original-backup` exists, copy it back
+  over `ois_server.exe` the same way.
 - **Mod:** delete the `oisbugfix` folder from `ObjectsInSpace/mods/`.
 
 ## Fixes included
 
-- **Pirate Hunt scenario crash** — missing bounds-check in the ship
-  spawn-selection loop, plus a log call with too few arguments for its
-  format string; both caused the same crash during ship spawning.
+- **Pirate Hunt scenario crash** — two independent causes, both fixed on
+  both `ois.exe` and `ois_server.exe`: a missing bounds-check in the
+  ship spawn-selection loop, and a separate log
+  call with too few arguments for its own format string a little
+  further down the same code path. Either one alone can crash the
+  game/server during ship spawning; the server binary has the
+  identical bugs and crashes the same way for anyone hosting or
+  joining a co-op game.
 - **Music player permanent failure loop** — the music player leaked a
   sound-engine handle on every track change; eventually the pool was
   exhausted and music stopped for the rest of the session.
@@ -142,13 +159,14 @@ re-run to pick up the newer fixes.
 
 ## Limitations
 
-Only tested against the **Windows Steam** build of `ois.exe` (game
-version 1.0.8, the last Steam release before the developers stopped
-supporting it). Every patch site checks its exact bytes before changing
-anything and skips itself with a warning rather than guessing, so
-running this against a different build should fail safely rather than
-corrupt anything — but it hasn't been verified against GOG, other
-storefronts, other game versions, or non-Windows builds, if any exist.
+Only tested against the **Windows Steam** build of `ois.exe` and
+`ois_server.exe` (game version 1.0.8, the last Steam release before the
+developers stopped supporting it). Every patch site checks its exact
+bytes before changing anything and skips itself with a warning rather
+than guessing, so running this against a different build should fail
+safely rather than corrupt anything — but it hasn't been verified
+against GOG, other storefronts, other game versions, or non-Windows
+builds, if any exist.
 
 ## Limitation of liability
 
@@ -160,9 +178,9 @@ from its use, including but not limited to save-file corruption, lost
 progress, an unstable or unlaunchable game install, or any other issue
 with your game or system. Modifying game files may also violate the
 terms of service of the platform you purchased the game through —
-checking that is on you. A backup of your original `ois.exe` is made
-automatically, but you're responsible for keeping it, and for your own
-save backups, before running this.
+checking that is on you. A backup of your original `ois.exe` and
+`ois_server.exe` is made automatically, but you're responsible for
+keeping it, and for your own save backups, before running this.
 
 ## License
 
@@ -171,6 +189,20 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.1 — 2026-08-30
+
+- Fixed a second Pirate Hunt crash cause on **both** `ois.exe` and `ois_server.exe`: a log call formatting a "duplicate ship-sets" message was missing an argument for its own format string, crashing with the same signature as the spawn-selection bug above. Found while live-testing 0.3.0's server fix — it correctly stopped the first crash, but a Pirate Hunt session could still hit this second, independent one a few lines later in the same code path.
+
+### 0.3.0 — 2026-08-30
+
+- Also patches `ois_server.exe`, the co-op server binary that ships
+  alongside `ois.exe`: the same Pirate Hunt spawn-selection crash fixed
+  on the client also exists in the server binary. Singleplayer never
+  runs `ois_server.exe`, so this only matters for hosting or joining a
+  co-op game — but it's a hard crash there every time, reported and
+  confirmed by a co-op host after 0.2.0 shipped.
+  (credit to Voidless7125 for bringing this to my attention)
 
 ### 0.2.0 — 2026-08-30
 
