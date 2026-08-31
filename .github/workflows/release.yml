@@ -45,6 +45,7 @@ jobs:
           git push origin "${{ steps.version.outputs.version }}"
 
       - name: Build zip package
+        id: package
         if: steps.check.outputs.should_release == 'true'
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -53,7 +54,7 @@ jobs:
           cp README.md LICENSE ois_patcher.py apply_data_fixes.py "$staging"/
           cp -r mod "$staging"/
           zip -r "${staging}.zip" "$staging"
-          echo "zip_name=${staging}.zip" >> "$GITHUB_ENV"
+          echo "zip_name=${staging}.zip" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
         if: steps.check.outputs.should_release == 'true'
@@ -62,4 +63,4 @@ jobs:
           tag_name: ${{ steps.version.outputs.version }}
           name: ${{ steps.version.outputs.version }}
           generate_release_notes: true
-          files: ${{ env.zip_name }}
+          files: ${{ steps.package.outputs.zip_name }}

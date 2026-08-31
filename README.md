@@ -64,7 +64,7 @@ copy of Flat Earth Games' own content.
 
 ## Usage
 
-```
+```py
 python ois_patcher.py "C:\Path\To\Objects in Space\ois.exe"
 ```
 
@@ -189,6 +189,10 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.2 - 2026-08-31
+
+- Quick fix for versioning on the mod.
 
 ### 0.3.1 — 2026-08-30
 
