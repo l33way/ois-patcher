@@ -119,6 +119,184 @@ FIXES = {
          "    addition=LongChinstrapBeard,head,face,face,,true",
          "    addition=LongChinstrapBeard,true,head,face,,true"),
     ],
+
+    # BUG-016: GRA 5's stealth/lowpoweruse configuration arrays had all 8
+    # of the module's original component slots wiped to -1 (only the 2
+    # slots unique to GRA 5, added when it was extended from the simpler
+    # 8-slot GRA design, kept real values) -- an authoring gap from that
+    # extension. A GRA 5 that rolls Stealth or Low Power Use condition in
+    # a shop installs with only 2 of 10 components: non-functioning and
+    # unsellable. Corrected values verified against real component stats
+    # (powermodifier/emissionsmodifier) and manufacturer lore, not just
+    # copied from GRA's own working lines -- GRA's own picks checked out,
+    # but GRA 5's *already-populated* trailing stealth value (53, a
+    # Ventarii/"durability" part matching its own defence tier) was a
+    # second, independent mistake, corrected here to 54 (Elander, the
+    # genuine lowest-emissions part in that family).
+    "modules_arms.txt": [
+        (1,
+         "configuration=stealth,-1,-1,-1,-1,-1,-1,-1,-1,35,53\n",
+         "configuration=stealth,24,35,-1,-1,-1,54,-1,-1,35,54\n"),
+        (1,
+         "configuration=lowpoweruse,-1,-1,-1,-1,-1,-1,-1,-1,33,52\n",
+         "configuration=lowpoweruse,22,33,-1,-1,-1,52,-1,-1,33,52\n"),
+    ],
+
+    # BUG-017: 6 of 9 LADAR modules have a configuration= array one
+    # element longer than the module's own compinterfaces.txt slot count
+    # -- every quality tier carries an extra id from the "burner"
+    # component family (100-103) with no matching UI slot anywhere in
+    # that module's interface definition. The client places components
+    # by array index directly into its slot list with no adjustment for
+    # the extra element, so every real component from the second slot
+    # onward renders one position off from its actual declared classtype,
+    # and the final real component has no valid slot at all and never
+    # appears. Fix: drop the stray leading value from every tier so the
+    # array length matches the module's real slot count again.
+    # tblb40 has a messier version of the same defect -- it's not just
+    # one extra value, it's also short a real shp1 slot's worth of data
+    # (3 shp1 values in the array where the UI declares 4) -- so its fix
+    # both drops the leading value and restores the missing 4th value,
+    # matching the pattern the other 3 known shp1 values in each tier
+    # already establish (stealth's partial reduction -- 2 active, 1 empty
+    # -- extended to a clean 2-of-4 rather than left ambiguous).
+    "modules_ladar.txt": [
+        (1,
+         "configuration=new,100,80,80,20,40,40,70,50,70\n",
+         "configuration=new,80,80,20,40,40,70,50,70\n"),
+        (1,
+         "configuration=stealth,103,-1,80,24,44,44,-1,-1,71\n",
+         "configuration=stealth,-1,80,24,44,44,-1,-1,71\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,81,22,43,43,-1,-1,72\n",
+         "configuration=lowpoweruse,-1,81,22,43,43,-1,-1,72\n"),
+        (1,
+         "configuration=boost,102,-1,80,22,43,43,-1,-1,70\n",
+         "configuration=boost,-1,80,22,43,43,-1,-1,70\n"),
+        (1,
+         "configuration=defence,101,83,83,23,43,43,73,53,73\n",
+         "configuration=defence,83,83,23,43,43,73,53,73\n"),
+
+        (1,
+         "configuration=new,100,80,80,20,50,70,50,30,30\n",
+         "configuration=new,80,80,20,50,70,50,30,30\n"),
+        (1,
+         "configuration=stealth,103,-1,80,-1,-1,71,54,35,35\n",
+         "configuration=stealth,-1,80,-1,-1,71,54,35,35\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,81,-1,-1,72,52,33,33\n",
+         "configuration=lowpoweruse,-1,81,-1,-1,72,52,33,33\n"),
+        (1,
+         "configuration=boost,102,-1,80,-1,-1,70,52,33,33\n",
+         "configuration=boost,-1,80,-1,-1,70,52,33,33\n"),
+        (1,
+         "configuration=defence,101,83,83,23,53,73,53,34,34\n",
+         "configuration=defence,83,83,23,53,73,53,34,34\n"),
+
+        (1,
+         "configuration=new,100,80,80,20,50,70,50,30,30,20\n",
+         "configuration=new,80,80,20,50,70,50,30,30,20\n"),
+        (1,
+         "configuration=stealth,103,-1,-1,-1,-1,71,54,35,35,24\n",
+         "configuration=stealth,-1,-1,-1,-1,71,54,35,35,24\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,-1,-1,-1,72,52,33,33,22\n",
+         "configuration=lowpoweruse,-1,-1,-1,-1,72,52,33,33,22\n"),
+        (1,
+         "configuration=boost,102,-1,-1,-1,-1,70,52,33,33,22\n",
+         "configuration=boost,-1,-1,-1,-1,70,52,33,33,22\n"),
+        (1,
+         "configuration=defence,101,83,83,23,53,73,53,34,34,23\n",
+         "configuration=defence,83,83,23,53,73,53,34,34,23\n"),
+
+        (1,
+         "configuration=new,100,80,80,20,50,70,50,30,20,40\n",
+         "configuration=new,80,80,20,50,70,50,30,20,40\n"),
+        (1,
+         "configuration=stealth,103,-1,-1,-1,-1,71,54,35,24,44\n",
+         "configuration=stealth,-1,-1,-1,-1,71,54,35,24,44\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,-1,-1,-1,72,52,33,22,43\n",
+         "configuration=lowpoweruse,-1,-1,-1,-1,72,52,33,22,43\n"),
+        (1,
+         "configuration=boost,102,-1,-1,-1,-1,70,52,33,22,43\n",
+         "configuration=boost,-1,-1,-1,-1,70,52,33,22,43\n"),
+        (1,
+         "configuration=defence,101,83,83,23,53,73,53,34,23,43\n",
+         "configuration=defence,83,83,23,53,73,53,34,23,43\n"),
+
+        (1,
+         "configuration=new,100,80,80,20,50,70,50,20,40,40\n",
+         "configuration=new,80,80,20,50,70,50,20,40,40\n"),
+        (1,
+         "configuration=stealth,103,-1,-1,-1,-1,71,54,24,44,44\n",
+         "configuration=stealth,-1,-1,-1,-1,71,54,24,44,44\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,-1,-1,-1,72,52,22,43,43\n",
+         "configuration=lowpoweruse,-1,-1,-1,-1,72,52,22,43,43\n"),
+        (1,
+         "configuration=boost,102,-1,-1,-1,-1,70,52,22,43,43\n",
+         "configuration=boost,-1,-1,-1,-1,70,52,22,43,43\n"),
+        (1,
+         "configuration=defence,101,83,83,23,53,73,53,23,43,43\n",
+         "configuration=defence,83,83,23,53,73,53,23,43,43\n"),
+
+        (1,
+         "configuration=new,100,80,80,70,40,40,40,40,30,30,30,30\n",
+         "configuration=new,80,80,70,40,40,40,40,30,30,30,30\n"),
+        (1,
+         "configuration=stealth,103,-1,-1,71,44,44,44,-1,-1,35,35,-1\n",
+         "configuration=stealth,-1,-1,71,44,44,44,-1,-1,35,35,-1\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,-1,72,43,43,43,-1,-1,33,33,-1\n",
+         "configuration=lowpoweruse,-1,-1,72,43,43,43,-1,-1,33,33,-1\n"),
+        (1,
+         "configuration=boost,102,-1,-1,70,43,43,43,-1,-1,33,33,-1\n",
+         "configuration=boost,-1,-1,70,43,43,43,-1,-1,33,33,-1\n"),
+        (1,
+         "configuration=defence,101,83,83,73,43,43,43,43,34,34,34,34\n",
+         "configuration=defence,83,83,73,43,43,43,43,34,34,34,34\n"),
+
+        (1,
+         "configuration=new,100,80,80,20,50,70,50,20,40,40,40\n",
+         "configuration=new,80,80,20,50,70,50,20,40,40,40,40\n"),
+        (1,
+         "configuration=stealth,103,-1,-1,-1,-1,71,54,24,44,44,-1\n",
+         "configuration=stealth,-1,-1,-1,-1,71,54,24,44,44,-1,-1\n"),
+        (1,
+         "configuration=lowpoweruse,103,-1,-1,-1,-1,72,52,22,43,43,43\n",
+         "configuration=lowpoweruse,-1,-1,-1,-1,72,52,22,43,43,43,43\n"),
+        (1,
+         "configuration=boost,102,-1,-1,-1,-1,70,52,22,43,43,43\n",
+         "configuration=boost,-1,-1,-1,-1,70,52,22,43,43,43,43\n"),
+        (1,
+         "configuration=defence,101,83,83,23,53,73,53,23,43,43,43\n",
+         "configuration=defence,83,83,23,53,73,53,23,43,43,43,43\n"),
+
+        # BUG-018: mkxladara2 and mkxladarat are the only 2 module ids in
+        # the entire game at exactly 10 characters. The network protocol
+        # that syncs an equipped module to a connecting client copies the
+        # identifier into a fixed 10-byte packet field via a safe-copy
+        # helper that truncates to fit rather than overflow -- correct
+        # behaviour for that helper, but the resulting mangled identifier
+        # ("mkxlad...") then fails to resolve to any real module on the
+        # receiving end, and nothing checks for that failure before
+        # dereferencing the (null) result: a hard, 100%-reproducible
+        # client crash on connect. Renaming both ids to 9 characters or
+        # fewer (matched below in compinterfaces.txt) avoids the overflow
+        # entirely -- neither id is referenced anywhere else in the
+        # game's data.
+        (1, "id=mkxladara2", "id=mkxladr2"),
+        (1, "id=mkxladarat", "id=mkxladrt"),
+    ],
+
+    # BUG-018 (see modules_ladar.txt above): compinterfaces.txt's own
+    # copy of each id must match the rename exactly, or the renamed
+    # module loses its wiring-diagram/repair-screen definition.
+    "compinterfaces.txt": [
+        (1, "\tid=mkxladara2", "\tid=mkxladr2"),
+        (1, "\tid=mkxladarat", "\tid=mkxladrt"),
+    ],
 }
 
 
