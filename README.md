@@ -190,6 +190,12 @@ non-commercial purposes, as long as you credit the original author
 
 ## Version history
 
+### 0.3.3 - 2026-09-01
+
+- Fixed the GRA 5 grappling arm installing non-functional and unsellable when bought in Stealth or Low Power Use condition — its data was missing 8 of 10 components in those two states (issue #7).
+- Fixed 6 LADAR modules (`MKX-LADAR-A-2`, `MKX-LADAR-A-T`, `MTL-C100`, `MTL-C150`, `MTL-CC`, `TBL-B42`) installing with every component shown in the wrong slot in the repair screen, due to a stray extra value in their data.
+- Fixed `MKX-LADAR-A-2` and `MKX-LADAR-A-T` crashing the game outright when equipped — their identifiers were exactly one character too long for a fixed network-packet field, and the game didn't handle the resulting failed lookup gracefully.
+
 ### 0.3.2 - 2026-08-31
 
 - Quick fix for versioning on the mod.

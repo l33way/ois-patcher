@@ -1,4 +1,4 @@
 name=Objects in Space - Unofficial Bugfix Patch
 author=Community
-version=0.3.2
+version=0.3.3
 description=Community bugfix patch for Objects in Space, fixing known data bugs from the abandoned 1.0.8 build. See BUGS.md in the source repo for details on each fix.

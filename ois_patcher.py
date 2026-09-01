@@ -108,7 +108,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.3.2"
+PATCHER_VERSION = "0.3.3"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
