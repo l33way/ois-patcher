@@ -1828,9 +1828,6 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
         print("Uninstall finished with problems (see above). The folder may now be a mix of\n"
               "patched and stock files; verifying the game files through Steam or GOG is the\n"
               "safest way back to a clean state.")
-    print("\nNote: this only undoes what ois_patcher.py did. Anything installed by\n"
-          "Patch_OIS.bat (its own Backup folder, OIS_Update.version.txt, firewall rules)\n"
-          "is separate -- run that script with -uninstall for those.")
     return ok
 
 
