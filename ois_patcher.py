@@ -1954,7 +1954,7 @@ def prepare_for_patch(client_exe, force=False, assume_yes=False):
 #      does NOT imply consent here; --update does.
 # ============================================================
 
-REPO_URL = ""  # e.g. "https://github.com/you/ois-patcher" -- shown when git isn't usable
+REPO_URL = "https://github.com/l33way/ois-patcher"  # -- shown when git isn't usable
 UPDATED_ENV = "OIS_PATCHER_SELF_UPDATED"  # re-exec guard: one update per invocation
 
 
