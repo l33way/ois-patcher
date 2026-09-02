@@ -19,6 +19,46 @@ Windows Steam install) is made automatically before anything is touched
 This patch is my attempt to change that — fixing what's broken, so it
 can be closer to what it was meant to be.
 
+## Goal: restoring original intent, not adding new features
+
+Every fix in this patch exists because something the developers clearly
+intended to work is instead broken, unreachable, or crashes. The scope
+is deliberately narrow: **restore the game to the state it evidently was
+meant to ship in — not redesign it, rebalance it, or extend it.**
+
+In practice, that means:
+
+- **A typo, a missing bounds-check, a leaked resource handle, 
+  an identifier one character too long for a fixed-size
+  buffer** — these are unambiguous bugs. Restoring the evidently
+  intended behavior is squarely in scope.
+- **Deliberate design choices are left alone, even ones that feel
+  restrictive or arbitrary.** If something is disabled by a hardcoded
+  developer list rather than broken by accident, that's a design
+  decision, not a bug — no matter how tempting a "fix" might be. (One
+  investigated example: LADAR modules turned out to be intentionally
+  excluded from the in-game shop's purchase list, confirmed via
+  disassembly of the actual filter the developers wrote — not a data
+  bug, not touched by this patch.)
+- **When a fix can't be pinned to a specific, proven original
+  behavior, this README says so plainly instead of presenting a guess
+  as a restoration.** One fix below (the mail-terminal `DEL` command)
+  was already broken — it only crashed, and never actually did
+  anything — before this patch, so there was no working original
+  behavior to restore. That entry is marked as a best-effort
+  interpretation of what the surrounding code seemed to be reaching
+  for, not a confirmed restoration, so you can judge it accordingly.
+- **Nothing here touches economy, difficulty, or content balance.**
+  Every fix corrects something that was never supposed to happen in the
+  first place, not something the developers shipped on purpose but that
+  plays out unfavorably.
+
+None of this is a judgment against going further — it's just not what
+*this* patch is for. If someone wants to build a rebalance, a difficulty
+overhaul, new content, or anything else on top of what's fixed here, I
+fully support that effort. This code is here to be built on for exactly
+that kind of work, within the terms of the license below.
+
 ## Why a Python script instead of a pre-patched `ois.exe`?
 
 This patch is distributed as source — a script you run against your own
@@ -49,52 +89,163 @@ copy of Flat Earth Games' own content.
 
 ## What's in this folder
 
-- `ois_patcher.py` — patches your `ois.exe` and `ois_server.exe`, and
-  installs the bugfix mod
-- `apply_data_fixes.py` — generates the data-only fixes from your own
-  `assets/` folder (see the file's own header for why they're not
-  shipped as ready-made files)
-- `mod/oisbugfix/modinfo.txt` — this mod's metadata; ship all three
-  files together — the patcher looks for them right next to itself
+Only one file here is ever run directly — the other two are support
+files it needs sitting alongside it. **All three must stay together in
+this same folder structure** (don't move or rename them individually):
+
+- **`ois_patcher.py`** — **this is the one you actually run.** A single
+  invocation patches `ois.exe` and `ois_server.exe`, and generates and
+  installs the bugfix mod, all in one pass (see "Installation" below).
+- `apply_data_fixes.py` — not something you run yourself. `ois_patcher.py`
+  imports and calls it automatically to build the data-only fixes
+  (typo/data corrections, generated fresh from *your own* `assets/`
+  folder rather than shipped as ready-made files — see the file's own
+  header for why).
+- `mod/oisbugfix/` — a folder, not a single file. Contains `modinfo.txt`
+  (this mod's own metadata, original content). `apply_data_fixes.py`
+  fills in the rest of this folder's contents at install time; keep the
+  folder itself intact and in place.
 
 ## Requirements
 
-- Python 3.8+
-- `pip install pefile`
+- **Python 3.8 or newer.**
+  - **Check if you already have it:** open a terminal (see step 2 under
+    "Installation" below for how) and run `python --version`. If that
+    prints something like `Python 3.11.4`, you're set — skip ahead to
+    Installation.
+  - **If it's not found, install it:** go to
+    [python.org/downloads](https://www.python.org/downloads/), download
+    the Windows installer, and run it. **On the installer's very first
+    screen, check the box "Add python.exe to PATH"** before clicking
+    Install — this is the single most commonly-missed step, and without
+    it none of the commands below will work. (Don't install Python from
+    the Microsoft Store instead — it uses a different mechanism that
+    can behave inconsistently for a script like this one.)
+  - **After installing,** close any terminal window you already had
+    open and open a new one (a terminal opened before installing Python
+    won't see the update), then confirm it worked with `python --version`
+    again.
+- **The `pefile` package.** Once Python itself is installed, open a
+  terminal and run:
+  ```
+  pip install pefile
+  ```
+  `pip` comes bundled with Python when installed from python.org, so
+  this should just work right after the step above. If `pip` also isn't
+  recognized, try `py -m pip install pefile` instead (see the `py`
+  launcher note under Troubleshooting below).
 
-## Usage
+## Installation
+
+**1. Download and unzip the patcher.** Get the latest release from the
+[GitHub repo](https://github.com/l33way/ois-patcher) — either the
+Releases page, or the green "Code → Download ZIP" button — then extract
+it: right-click the downloaded `.zip` file in File Explorer and choose
+"Extract All...". Don't try to run anything straight out of the zip;
+extract it to a real folder first. `ois_patcher.py`, `apply_data_fixes.py`,
+and the `mod/oisbugfix/` folder (see "What's in this folder" above) all
+need to end up together in that one extracted folder.
+
+**2. Open a terminal in that folder.** In File Explorer, open the
+folder you just extracted (the one containing `ois_patcher.py`), then
+either type `cmd` into the address bar and press Enter, or
+Shift+right-click empty space in the folder and choose "Open PowerShell
+window here" / "Open in Terminal."
+
+**3. Run this one command**, replacing the path with wherever *your*
+copy of the game is actually installed:
 
 ```py
 python ois_patcher.py "C:\Path\To\Objects in Space\ois.exe"
 ```
 
-Point it at the `ois.exe` inside your game's install folder (right next
-to the `ObjectsInSpace` subfolder — that's how the patcher finds where
-to install the mod). It will:
+- Point it at `ois.exe` itself (not the folder) — the file directly
+  inside your game's install folder, sitting right next to an
+  `ObjectsInSpace` subfolder and an `assets` subfolder. That's how the
+  patcher locates everything else it needs. (In Steam: right-click
+  *Objects in Space* → Properties → Installed Files → Browse, if you're
+  not sure where yours is.)
+- **Keep the quotes around the path.** The default Steam install path
+  contains a space (`Objects in Space`), and an unquoted path with a
+  space in it will fail or silently target the wrong thing.
+- A typical default path looks like:
+  `C:\Program Files (x86)\Steam\steamapps\common\Objects in Space\ois.exe`
 
-1. Back up your original `ois.exe` as `ois.exe.original-backup`
+**That's it — one command, one run.** You do not need to run
+`apply_data_fixes.py` yourself, and there is no separate mod-install
+step: the single command above does everything described below
+automatically, in order:
+
+1. Backs up your original `ois.exe` as `ois.exe.original-backup`
    (created once — running the patcher again reuses the existing
-   backup rather than overwriting it)
-2. Apply the binary fixes listed below, in place
-3. Back up and patch `ois_server.exe` the same way — it ships alongside
-   `ois.exe` in every Windows Steam install and is needed for
+   backup rather than overwriting it).
+2. Applies the binary fixes listed below, in place.
+3. Backs up and patches `ois_server.exe` the same way — it ships
+   alongside `ois.exe` in every Windows Steam install and is needed for
    hosting/joining co-op games (singleplayer never runs it, but it's
    still there). Its own separate backup, checked and skipped just as
    safely if anything doesn't match. If it's genuinely missing (e.g. a
    modified install), this step is skipped quietly rather than erroring.
-4. Install the `oisbugfix` mod into `ObjectsInSpace/mods/oisbugfix/`
+4. Generates and installs the `oisbugfix` mod into
+   `ObjectsInSpace/mods/oisbugfix/`, reading the affected files fresh
+   out of your own `assets/` folder.
+
+**4. Check the summary printed at the end.** A successful run ends with
+a block like:
+
+```
+Applied 9 exe fix(es), skipped 0.
+ois_server.exe: applied 2 fix(es), skipped 0.
+Bugfix mod: installed
+```
+
+If anything shows as skipped, scroll up — the patcher explains exactly
+why (usually a different game version, or something already patched).
+Skipped items don't stop the rest of the run; every other fix still
+applies normally.
 
 Every patch checks the exact bytes it's about to change first, and
 skips itself with a warning (rather than guessing) if anything doesn't
 match — a different game version, or a file already modified some other
 way. It's safe to re-run against an *unpatched* backup at any time.
 
-Running it against an `ois.exe` (or `ois_server.exe`) that's already been
-patched won't touch anything — each binary independently detects its own
-previous work and tells you exactly what's going on: if it's the same
-version, there's nothing to do for that binary; if it's an older version,
-it'll tell you to restore that binary's own `.original-backup` and re-run
-to pick up the newer fixes.
+Running it again against an `ois.exe` (or `ois_server.exe`) that's
+already been patched won't touch anything — each binary independently
+detects its own previous work and tells you exactly what's going on: if
+it's the same version, there's nothing to do for that binary; if it's
+an older version, it'll tell you to restore that binary's own
+`.original-backup` and re-run to pick up the newer fixes.
+
+### Troubleshooting
+
+- **Double-clicking `ois_patcher.py` by itself makes a window flash and
+  disappear instantly.** This is expected, not a crash — the script has
+  nothing telling it which `ois.exe` to patch, so it immediately prints
+  a "missing argument" error and exits, and Windows closes the console
+  window before you can read that error. Run it from a terminal with
+  the `ois.exe` path as shown above instead of double-clicking it plain.
+- **`'python' is not recognized...`, or a Microsoft Store page opens
+  when you try to run it.** Python isn't installed, or isn't on your
+  system's PATH. Install it from
+  [python.org/downloads](https://www.python.org/downloads/) (not the
+  Microsoft Store version, which can behave differently on Windows) —
+  and make sure to check **"Add python.exe to PATH"** on the installer's
+  first screen. If Python is already installed this way and `python`
+  still doesn't work, try `py` in its place (Windows' own Python
+  launcher, installed alongside python.org's Python) — e.g.
+  `py ois_patcher.py "C:\Path\To\Objects in Space\ois.exe"`.
+- **`ModuleNotFoundError: No module named 'pefile'`.** You're missing
+  the one required package — run `pip install pefile` (or
+  `py -m pip install pefile`) in a terminal, then try again.
+- **It says some fixes were "skipped."** Scroll up in the output — the
+  patcher always explains why (usually a different game version than
+  this patch targets, 1.0.8, or that file already having been patched
+  by an earlier run). This is expected, safe behavior, not a failure —
+  every other fix still applies normally.
+
+Still stuck? Open an issue on the
+[GitHub repo](https://github.com/l33way/ois-patcher/issues) with what
+you tried and exactly what you saw.
 
 ### Reverting
 
@@ -156,6 +307,19 @@ to pick up the newer fixes.
   the exact wrong instant. Fixed by ignoring the "open PDA" key press
   for that instant instead — press it again a moment later and it
   opens normally.
+- **GRA 5 grappling arm installs broken and unsellable** — its data was
+  missing 8 of 10 components whenever a shop rolled it in Stealth or
+  Low Power Use condition. (Mod-only fix, no exe patch needed.)
+- **6 LADAR modules show every component in the wrong repair-screen
+  slot** (`MKX-LADAR-A-2`, `MKX-LADAR-A-T`, `MTL-C100`, `MTL-C150`,
+  `MTL-CC`, `TBL-B42`) — a stray extra value in their configuration
+  data shifted every real component one slot off from where it's
+  actually declared. (Mod-only fix, no exe patch needed.)
+- **`MKX-LADAR-A-2`/`MKX-LADAR-A-T` crash the game on equip** — their
+  identifiers were exactly one character too long for a fixed-size
+  network packet field; the resulting mangled identifier failed to
+  resolve with no fallback. Fixed by shortening both ids. (Mod-only
+  fix, no exe patch needed.)
 
 ## Limitations
 
@@ -196,9 +360,13 @@ non-commercial purposes, as long as you credit the original author
 - Fixed 6 LADAR modules (`MKX-LADAR-A-2`, `MKX-LADAR-A-T`, `MTL-C100`, `MTL-C150`, `MTL-CC`, `TBL-B42`) installing with every component shown in the wrong slot in the repair screen, due to a stray extra value in their data.
 - Fixed `MKX-LADAR-A-2` and `MKX-LADAR-A-T` crashing the game outright when equipped — their identifiers were exactly one character too long for a fixed network-packet field, and the game didn't handle the resulting failed lookup gracefully.
 
+(credit to Voidless7125 for bringing these issues to my attention)
+
 ### 0.3.2 - 2026-08-31
 
 - Quick fix for versioning on the mod.
+
+(credit to Voidless7125 for creating the fix for this)
 
 ### 0.3.1 — 2026-08-30
 
@@ -212,7 +380,8 @@ non-commercial purposes, as long as you credit the original author
   runs `ois_server.exe`, so this only matters for hosting or joining a
   co-op game — but it's a hard crash there every time, reported and
   confirmed by a co-op host after 0.2.0 shipped.
-  (credit to Voidless7125 for bringing this to my attention)
+
+(credit to Voidless7125 for bringing this to my attention)
 
 ### 0.2.0 — 2026-08-30
 
