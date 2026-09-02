@@ -28,7 +28,7 @@ meant to ship in — not redesign it, rebalance it, or extend it.**
 
 In practice, that means:
 
-- **A typo, a missing bounds-check, a leaked resource handle, 
+- **A typo, a missing bounds-check, a leaked resource handle,
   an identifier one character too long for a fixed-size
   buffer** — these are unambiguous bugs. Restoring the evidently
   intended behavior is squarely in scope.
@@ -127,9 +127,11 @@ this same folder structure** (don't move or rename them individually):
     again.
 - **The `pefile` package.** Once Python itself is installed, open a
   terminal and run:
+
   ```
   pip install pefile
   ```
+
   `pip` comes bundled with Python when installed from python.org, so
   this should just work right after the step above. If `pip` also isn't
   recognized, try `py -m pip install pefile` instead (see the `py`
@@ -353,6 +355,19 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.4 - 2026-09-02
+
+- Added automatic Steam and GOG install discovery, including Steam libraries
+  on other drives, with an interactive choice when multiple installs are
+  found.
+- Added `--list-installs`, `--status`, `--uninstall`, `--force`, and
+  `--update` modes, plus `OIS_TARGET_DIR` for scripted or headless installs.
+- Added embedded patch-version markers so older patcher releases can be
+  upgraded safely from their original backups instead of patching on top.
+- Improved executable validation, backup verification, and failure handling;
+  the data-only mod now degrades to a warning when its companion files are
+  unavailable.
 
 ### 0.3.3 - 2026-09-01
 
