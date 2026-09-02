@@ -1153,7 +1153,7 @@ def patch_server_exe(exe_path):
     try:
         data = bytearray(server_path.read_bytes())
     except OSError as e:
-        print(f"\n[SKIP] Could not read {server_path}: {e}")
+        print(f"\n[SKIP] Could not read {server_path}: {e}", file=sys.stderr)
         return False
 
     ok, reason = validate_pe(data, server_path.name)
@@ -1168,7 +1168,7 @@ def patch_server_exe(exe_path):
         try:
             backup_path.write_bytes(data)
         except OSError as e:
-            print(f"\n[SKIP] Could not write the server backup to {backup_path}: {e}")
+            print(f"\n[SKIP] Could not write the server backup to {backup_path}: {e}", file=sys.stderr)
             return False
         print(f"\nBacked up original server exe to {backup_path}")
 
@@ -1176,7 +1176,7 @@ def patch_server_exe(exe_path):
     try:
         ptch_va, ptch_off, ptch_size = add_ptch_section(data)
     except RuntimeError as e:
-        print(f"ois_server.exe: {e}")
+        print(f"ois_server.exe: {e}", file=sys.stderr)
         return False
 
     pe = load_pe(data)
@@ -1492,7 +1492,7 @@ def _prompt_for_dir():
             return None
         if is_game_dir(path):
             return path
-        print(f"[ERROR] No {GAME_EXE_NAME} in: {path}")
+        print(f"[ERROR] No {GAME_EXE_NAME} in: {path}", file=sys.stderr)
     return None
 
 
@@ -1521,7 +1521,7 @@ def _choose_dir(found):
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(found):
             return found[int(raw) - 1][0]
-        print("[ERROR] Not one of the listed numbers.")
+        print("[ERROR] Not one of the listed numbers.", file=sys.stderr)
     return None
 
 
@@ -1691,7 +1691,7 @@ def restore_exe(exe_path, keep_backup=True):
     backup = backup_path_for(exe_path)
     usable, reason = check_backup_usable(backup)
     if not usable:
-        print(f"  [SKIP] {exe_path.name}: {reason}")
+        print(f"  [SKIP] {exe_path.name}: {reason}", file=sys.stderr)
         return False
 
     original = backup.read_bytes()
@@ -1828,6 +1828,9 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
         print("Uninstall finished with problems (see above). The folder may now be a mix of\n"
               "patched and stock files; verifying the game files through Steam or GOG is the\n"
               "safest way back to a clean state.")
+    print("\nNote: this only undoes what ois_patcher.py did. Anything installed by\n"
+          "Patch_OIS.bat (its own Backup folder, OIS_Update.version.txt, firewall rules)\n"
+          "is separate -- run that script with -uninstall for those.")
     return ok
 
 
@@ -1954,7 +1957,7 @@ def prepare_for_patch(client_exe, force=False, assume_yes=False):
 #      does NOT imply consent here; --update does.
 # ============================================================
 
-REPO_URL = "https://github.com/l33way/ois-patcher"  # -- shown when git isn't usable
+REPO_URL = ""  # e.g. "https://github.com/you/ois-patcher" -- shown when git isn't usable
 UPDATED_ENV = "OIS_PATCHER_SELF_UPDATED"  # re-exec guard: one update per invocation
 
 
