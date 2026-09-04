@@ -28,7 +28,7 @@ meant to ship in — not redesign it, rebalance it, or extend it.**
 
 In practice, that means:
 
-- **A typo, a missing bounds-check, a leaked resource handle, 
+- **A typo, a missing bounds-check, a leaked resource handle,
   an identifier one character too long for a fixed-size
   buffer** — these are unambiguous bugs. Restoring the evidently
   intended behavior is squarely in scope.
@@ -94,8 +94,9 @@ files it needs sitting alongside it. **All three must stay together in
 this same folder structure** (don't move or rename them individually):
 
 - **`ois_patcher.py`** — **this is the one you actually run.** A single
-  invocation patches `ois.exe` and `ois_server.exe`, and generates and
-  installs the bugfix mod, all in one pass (see "Installation" below).
+  invocation locates your game, patches `ois.exe` and `ois_server.exe`,
+  and generates and installs the bugfix mod, all in one pass (see
+  "Installation" below).
 - `apply_data_fixes.py` — not something you run yourself. `ois_patcher.py`
   imports and calls it automatically to build the data-only fixes
   (typo/data corrections, generated fresh from *your own* `assets/`
@@ -127,13 +128,21 @@ this same folder structure** (don't move or rename them individually):
     again.
 - **The `pefile` package.** Once Python itself is installed, open a
   terminal and run:
+
   ```
   pip install pefile
   ```
+
   `pip` comes bundled with Python when installed from python.org, so
   this should just work right after the step above. If `pip` also isn't
   recognized, try `py -m pip install pefile` instead (see the `py`
   launcher note under Troubleshooting below).
+- **`git` (optional).** Only needed if you want the patcher to check for
+  and pull its own updates from a `git clone` of this repo (see
+  "Checking for updates" below). Not required for anything else — a
+  plain downloaded-and-unzipped copy works fine for patching, checking
+  status, and uninstalling; the patcher just won't be able to update
+  itself and will say so.
 
 ## Installation
 
@@ -146,47 +155,75 @@ extract it to a real folder first. `ois_patcher.py`, `apply_data_fixes.py`,
 and the `mod/oisbugfix/` folder (see "What's in this folder" above) all
 need to end up together in that one extracted folder.
 
+(If you'd rather clone the repo with `git` instead of downloading a
+zip, that works too — and it's what lets the patcher check for and pull
+its own updates later. See "Checking for updates" below.)
+
 **2. Open a terminal in that folder.** In File Explorer, open the
 folder you just extracted (the one containing `ois_patcher.py`), then
 either type `cmd` into the address bar and press Enter, or
 Shift+right-click empty space in the folder and choose "Open PowerShell
 window here" / "Open in Terminal."
 
-**3. Run this one command**, replacing the path with wherever *your*
-copy of the game is actually installed:
+**3. Run this one command:**
+
+```py
+python ois_patcher.py
+```
+
+That's it — no path required. The patcher looks for your game the same
+way Steam and GOG themselves would: Steam's own registry entries and
+default install folders, every Steam library (including ones on other
+drives), and GOG's registry records, in that order. If it finds exactly
+one install, it uses it and tells you which one. If it finds more than
+one, it lists all of them and asks which to patch — nothing is ever
+silently picked for you between two installs. If it can't find one at
+all, it asks you to paste the path.
+
+If you'd rather point it at a specific copy yourself — say, you have
+more than one install and want to skip the prompt, or auto-detection
+doesn't find yours for some reason — you can still give it the path
+explicitly, same as before:
 
 ```py
 python ois_patcher.py "C:\Path\To\Objects in Space\ois.exe"
 ```
 
-- Point it at `ois.exe` itself (not the folder) — the file directly
-  inside your game's install folder, sitting right next to an
-  `ObjectsInSpace` subfolder and an `assets` subfolder. That's how the
-  patcher locates everything else it needs. (In Steam: right-click
-  *Objects in Space* → Properties → Installed Files → Browse, if you're
-  not sure where yours is.)
+or, equivalently:
+
+```py
+python ois_patcher.py --game-dir "C:\Path\To\Objects in Space"
+```
+
+- Either the folder itself or the `ois.exe` inside it works — the
+  patcher figures out which you gave it.
 - **Keep the quotes around the path.** The default Steam install path
   contains a space (`Objects in Space`), and an unquoted path with a
   space in it will fail or silently target the wrong thing.
 - A typical default path looks like:
   `C:\Program Files (x86)\Steam\steamapps\common\Objects in Space\ois.exe`
+- Running it repeatedly with an environment variable instead — say,
+  from your own script — is also supported: set `OIS_TARGET_DIR` to
+  your install folder and just run `python ois_patcher.py` with no
+  argument. An explicit path or `--game-dir` always overrides it.
 
 **That's it — one command, one run.** You do not need to run
 `apply_data_fixes.py` yourself, and there is no separate mod-install
 step: the single command above does everything described below
 automatically, in order:
 
-1. Backs up your original `ois.exe` as `ois.exe.original-backup`
+1. Finds your game install (auto-detected, or the path you gave it).
+2. Backs up your original `ois.exe` as `ois.exe.original-backup`
    (created once — running the patcher again reuses the existing
    backup rather than overwriting it).
-2. Applies the binary fixes listed below, in place.
-3. Backs up and patches `ois_server.exe` the same way — it ships
+3. Applies the binary fixes listed below, in place.
+4. Backs up and patches `ois_server.exe` the same way — it ships
    alongside `ois.exe` in every Windows Steam install and is needed for
    hosting/joining co-op games (singleplayer never runs it, but it's
    still there). Its own separate backup, checked and skipped just as
    safely if anything doesn't match. If it's genuinely missing (e.g. a
    modified install), this step is skipped quietly rather than erroring.
-4. Generates and installs the `oisbugfix` mod into
+5. Generates and installs the `oisbugfix` mod into
    `ObjectsInSpace/mods/oisbugfix/`, reading the affected files fresh
    out of your own `assets/` folder.
 
@@ -209,21 +246,76 @@ skips itself with a warning (rather than guessing) if anything doesn't
 match — a different game version, or a file already modified some other
 way. It's safe to re-run against an *unpatched* backup at any time.
 
-Running it again against an `ois.exe` (or `ois_server.exe`) that's
-already been patched won't touch anything — each binary independently
-detects its own previous work and tells you exactly what's going on: if
-it's the same version, there's nothing to do for that binary; if it's
-an older version, it'll tell you to restore that binary's own
-`.original-backup` and re-run to pick up the newer fixes.
+### Checking what's installed
+
+```py
+python ois_patcher.py --status
+```
+
+Reports, for your detected (or given) install: whether each exe is
+patched and by which version, whether its backup is present and usable,
+and whether the bugfix mod is installed. Doesn't check for updates and
+doesn't change anything — safe to run any time out of curiosity.
+
+### Updating
+
+Running `python ois_patcher.py` again picks this up on its own — no
+separate command needed:
+
+- **Already at the current version:** the exe(s) are left alone, and
+  only the data-only mod is refreshed (handy if you ever deleted the
+  `oisbugfix` folder by hand and want it back without touching the exe).
+- **Patched by an older version of this tool:** you'll be asked to
+  confirm, then the patcher restores the original from
+  `<name>.original-backup` and re-applies the current fixes on top of
+  that clean original — never on top of an already-patched file. Your
+  existing backup is kept and reused; nothing is re-downloaded or
+  re-copied for this.
+- **Patched by a newer version than the copy of the script you're
+  running:** the patcher refuses, rather than downgrading you. Get the
+  current release and run that instead (see "Checking for updates for
+  the patcher itself" below), or pass `--force` if you genuinely want
+  to go backward.
+
+You can also force a from-scratch re-patch even when already current
+with `--force`, and skip all the "are you sure?" prompts (for scripted
+or unattended runs) with `--yes`.
+
+### Checking for updates for the patcher itself
+
+If you got this patcher via `git clone` (rather than a downloaded zip),
+a plain `python ois_patcher.py` run also checks whether a newer version
+of the *script itself* is available upstream, before it does anything
+to your game:
+
+- If your checkout is current, it says so and moves straight on to
+  patching.
+- If an update is available, it shows what's changed and asks before
+  doing anything — this never pulls new code without your say-so, even
+  if you passed `--yes` (that only answers the game-patching prompts).
+  Say yes with `--update` on the command line to skip that ask (e.g.
+  for a scripted update-and-patch run), or decline and it just patches
+  with the version you already have.
+- If you pulled a newer version, the patcher restarts itself
+  automatically to make sure the new code is actually the code that
+  runs — you don't need to re-run anything yourself.
+- If you downloaded a zip instead of cloning with git, or if `git`
+  itself isn't installed, this check is skipped automatically and
+  patching proceeds normally with your local copy. Check the
+  [GitHub repo](https://github.com/l33way/ois-patcher) yourself now and
+  then if you want to know about new releases.
+
+Skip this check entirely (e.g. if you're offline and don't want the
+delay) with `--no-update-check`.
 
 ### Troubleshooting
 
-- **Double-clicking `ois_patcher.py` by itself makes a window flash and
-  disappear instantly.** This is expected, not a crash — the script has
-  nothing telling it which `ois.exe` to patch, so it immediately prints
-  a "missing argument" error and exits, and Windows closes the console
-  window before you can read that error. Run it from a terminal with
-  the `ois.exe` path as shown above instead of double-clicking it plain.
+- **Double-clicking `ois_patcher.py` makes a window flash and
+  disappear instantly.** This usually means Windows closed the console
+  before you could read what happened — auto-detection may have needed
+  to ask you a question (which one of several installs, or a path to
+  paste) that a double-click can't answer. Run it from a terminal
+  instead, as shown above, so you can see and respond to any prompts.
 - **`'python' is not recognized...`, or a Microsoft Store page opens
   when you try to run it.** Python isn't installed, or isn't on your
   system's PATH. Install it from
@@ -233,10 +325,21 @@ an older version, it'll tell you to restore that binary's own
   first screen. If Python is already installed this way and `python`
   still doesn't work, try `py` in its place (Windows' own Python
   launcher, installed alongside python.org's Python) — e.g.
-  `py ois_patcher.py "C:\Path\To\Objects in Space\ois.exe"`.
+  `py ois_patcher.py`.
 - **`ModuleNotFoundError: No module named 'pefile'`.** You're missing
   the one required package — run `pip install pefile` (or
   `py -m pip install pefile`) in a terminal, then try again.
+- **"Could not automatically find the game folder."** Auto-detection
+  covers standard Steam and GOG installs; an unusual setup (a
+  non-default GOG install path, a Steam library it couldn't see, a
+  storefront other than Steam/GOG) can miss yours. Paste the path when
+  asked, or run it with the path directly:
+  `python ois_patcher.py "C:\Path\To\Objects in Space"`.
+- **It found more than one install and I don't recognize one of
+  them.** Old installs (a previous drive, an old Steam library you
+  haven't cleaned up, a leftover GOG copy) can still show up here even
+  if you don't play from them anymore. Pick the one you actually use;
+  the others are just left alone.
 - **It says some fixes were "skipped."** Scroll up in the output — the
   patcher always explains why (usually a different game version than
   this patch targets, 1.0.8, or that file already having been patched
@@ -248,6 +351,26 @@ Still stuck? Open an issue on the
 you tried and exactly what you saw.
 
 ### Reverting
+
+```py
+python ois_patcher.py --uninstall
+```
+
+Run against your detected (or given) install, this puts the game folder
+back the way it was: restores `ois.exe` and `ois_server.exe` from their
+`.original-backup` files (each one verified to be a genuine pristine
+original before it's used, and the restore itself verified byte-for-byte
+after writing), and removes the `oisbugfix` folder from
+`ObjectsInSpace/mods/`. Asks for confirmation first, showing exactly
+what it's about to do; add `--yes` to skip that if you're scripting it.
+Your save games and every other game file are left untouched.
+
+By default the `.original-backup` files are deleted once they've been
+successfully restored from (their job is done). Pass `--keep-backups`
+if you'd rather they stick around.
+
+If you'd prefer to do it by hand instead, that still works exactly as
+before:
 
 - **Client exe:** copy `ois.exe.original-backup` back over `ois.exe`.
 - **Server exe:** if `ois_server.exe.original-backup` exists, copy it back
@@ -330,7 +453,10 @@ bytes before changing anything and skips itself with a warning rather
 than guessing, so running this against a different build should fail
 safely rather than corrupt anything — but it hasn't been verified
 against GOG, other storefronts, other game versions, or non-Windows
-builds, if any exist.
+builds, if any exist. Auto-detection can *locate* a GOG install, but the
+binary fixes themselves are only confirmed against the Steam 1.0.8
+build either way — the same "check first, skip safely if it doesn't
+match" behavior applies regardless of where the exe came from.
 
 ## Limitation of liability
 
@@ -353,6 +479,57 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.4 - 2026-09-02
+
+- **No more typing a path.** Running `python ois_patcher.py` with no
+  arguments now finds your Steam or GOG install automatically —
+  checking Steam's registry entries and default folders, every Steam
+  library including ones on other drives, and GOG's registry records.
+  Asks which install to use if it finds more than one, and asks you to
+  paste a path if it can't find any. Pointing it at a specific
+  `ois.exe` or install folder still works exactly as before, and a new
+  `--game-dir` flag and `OIS_TARGET_DIR` environment variable are
+  available for scripted setups.
+- **Added `--uninstall`**, which restores `ois.exe` and `ois_server.exe`
+  from their backups and removes the `oisbugfix` mod folder in one
+  step, after confirming what it's about to do. No more manual
+  copy-the-backup-back-yourself. Each backup is checked to make sure
+  it's a genuine unpatched original before being used, and the restore
+  is verified byte-for-byte after writing. `--yes` skips the
+  confirmation for scripted use; `--keep-backups` keeps the backup
+  files afterward instead of deleting them.
+- **Added `--status`**, which reports what's currently installed (which
+  exes are patched, by which version, whether their backups are usable,
+  whether the mod is installed) without changing anything.
+- **Updating is now automatic.** Running the patcher again against an
+  install patched by an older version of this tool now asks to update
+  it for you: restores the original from its backup, then re-applies
+  the current fixes to that clean original — never on top of an
+  already-patched file. An install already on the current version is
+  left alone (with the mod refreshed in case you'd deleted it). Trying
+  to run an *older* copy of the patcher against an install patched by a
+  *newer* one is now refused instead of silently downgrading it, unless
+  you pass `--force`.
+- **Added a self-update check.** If this patcher was set up via
+  `git clone`, a normal run now checks whether a newer version of the
+  script itself is available and offers to pull and use it, before
+  touching your game. Skipped automatically for a plain downloaded zip,
+  or if `git` isn't installed. `--update` accepts the update without
+  asking (for scripted runs); `--no-update-check` skips the check
+  entirely.
+- **More reliable failure handling throughout.** A truncated or
+  corrupted exe is now reported clearly and safely instead of crashing
+  with a raw error — and no longer leaves a stray backup file behind
+  when that happens. A corrupted `ois_server.exe` no longer prevents
+  `ois.exe` from being patched successfully. The data-only mod install
+  now degrades to a clear warning (matching what this README already
+  promised) instead of failing outright if its companion file is
+  missing. The patcher also checks that the target files are actually
+  writable (e.g. the game isn't currently running) before making any
+  changes, rather than partway through.
+
+( credit to Voidless7125 for this amazing usability update! )
 
 ### 0.3.3 - 2026-09-01
 

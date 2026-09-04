@@ -21,12 +21,37 @@ below), and writes only the corrected result into the mod folder. The
 game's own content never leaves your machine.
 
 Usage:
+    python ois_patcher.py
+    python ois_patcher.py "C:\\path\\to\\Objects in Space"
     python ois_patcher.py "C:\\path\\to\\Objects in Space\\ois.exe"
+    python ois_patcher.py --list-installs
+    python ois_patcher.py --status
+    python ois_patcher.py --uninstall
+    python ois_patcher.py --update
+
+With no path given, the install is located the same way Patch_OIS.bat
+locates it -- Steam's registry keys and default folders, then every
+library in libraryfolders.vdf -- extended to cover GOG installs and to
+read the folder name out of Steam's own app manifest rather than
+assuming it. An explicit path always wins; OIS_TARGET_DIR is consulted
+before falling back to a prompt. A folder is only accepted if ois.exe
+is actually in it, and if two installs are found the choice is put to
+the user rather than guessed at.
 
 Expects apply_data_fixes.py and a "mod" folder containing "oisbugfix"
 (just modinfo.txt) next to this script -- ship all three together when
 distributing this patcher. Skips mod installation with a warning,
 rather than failing, if either is missing.
+
+Updating and uninstalling are both driven by the version marker
+embedded in the patched exe itself, so the installed state is read off
+the file rather than a receipt that can go stale. Run against an
+install patched by an older release, the script restores the original
+from its backup and re-applies the current fixes, after asking; an
+install already at this version is left alone and only its data-only
+mod is refreshed. --uninstall reverses everything: stock exes back from
+their backups (each verified stock before use, and byte-verified after
+writing), mod folder deleted, saves and settings untouched.
 
 Backs up the original alongside itself as "<name>.original-backup"
 (created once, on first run -- never overwritten by later runs) and
@@ -84,7 +109,11 @@ entry pointing into overwritten bytes corrupts them at load time
 regardless of what replaced them.
 """
 import argparse
+import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -94,7 +123,13 @@ except ImportError:
     print("This script needs 'pefile': pip install pefile", file=sys.stderr)
     sys.exit(1)
 
-import apply_data_fixes
+# The docstring promises the mod install degrades to a warning if this is
+# missing, so a hard ImportError here would break that promise on the very
+# setup it was written for: someone who copied out just ois_patcher.py.
+try:
+    import apply_data_fixes
+except ImportError:
+    apply_data_fixes = None
 
 IMAGE_BASE = 0x400000
 FIXES_APPLIED = []
@@ -108,13 +143,39 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.3.3"
+PATCHER_VERSION = "0.3.4"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
 
 def load_pe(data):
     return pefile.PE(data=bytes(data), fast_load=True)
+
+
+def validate_pe(data, label):
+    """Confirms a blob really is the 32-bit PE this tool knows how to
+    patch, before anything is written anywhere. Returns (ok, reason).
+
+    pefile raises a whole family of things on malformed input, not just
+    PEFormatError -- a truncated file can surface as struct.error or an
+    AttributeError from a header that never got parsed -- so this catches
+    broadly and turns all of it into one readable sentence."""
+    try:
+        pe = load_pe(data)
+    except Exception as e:
+        return False, (f"{label} is not a Windows executable this tool can read ({e}). "
+                       f"If this file is truncated or corrupt, use Steam's \"Verify integrity "
+                       f"of game files\" (or reinstall from GOG) to get a good copy.")
+    try:
+        image_base = pe.OPTIONAL_HEADER.ImageBase  # read it before close()
+    except Exception as e:
+        pe.close()
+        return False, f"{label}: could not read the PE optional header ({e})."
+    pe.close()
+    if image_base != IMAGE_BASE:
+        return False, (f"{label}: unexpected ImageBase {hex(image_base)} -- this doesn't look "
+                       f"like the expected build.")
+    return True, None
 
 
 def va_to_offset(pe, va):
@@ -1089,27 +1150,33 @@ def patch_server_exe(exe_path):
               f"(only matters for hosting/joining co-op games).")
         return False
 
-    backup_path = server_path.with_name(server_path.name + ".original-backup")
+    try:
+        data = bytearray(server_path.read_bytes())
+    except OSError as e:
+        print(f"\n[SKIP] Could not read {server_path}: {e}", file=sys.stderr)
+        return False
+
+    ok, reason = validate_pe(data, server_path.name)
+    if not ok:
+        print(f"\n[SKIP] {reason}", file=sys.stderr)
+        return False
+
+    backup_path = server_path.with_name(server_path.name + BACKUP_SUFFIX)
     if backup_path.exists():
         print(f"\nServer backup already exists at {backup_path} -- not overwriting it.")
     else:
-        backup_path.write_bytes(server_path.read_bytes())
+        try:
+            backup_path.write_bytes(data)
+        except OSError as e:
+            print(f"\n[SKIP] Could not write the server backup to {backup_path}: {e}", file=sys.stderr)
+            return False
         print(f"\nBacked up original server exe to {backup_path}")
-
-    data = bytearray(server_path.read_bytes())
-
-    pe_check = load_pe(data)
-    if pe_check.OPTIONAL_HEADER.ImageBase != IMAGE_BASE:
-        pe_check.close()
-        print(f"Unexpected ImageBase {hex(pe_check.OPTIONAL_HEADER.ImageBase)} in ois_server.exe -- skipping.", file=sys.stderr)
-        return False
-    pe_check.close()
 
     print("Adding patch section to ois_server.exe...")
     try:
         ptch_va, ptch_off, ptch_size = add_ptch_section(data)
     except RuntimeError as e:
-        print(f"ois_server.exe: {e}")
+        print(f"ois_server.exe: {e}", file=sys.stderr)
         return False
 
     pe = load_pe(data)
@@ -1155,6 +1222,10 @@ def find_bundled_mod_dir():
 
 
 def install_mod(exe_path):
+    if apply_data_fixes is None:
+        print("\n[SKIP] Bugfix mod: apply_data_fixes.py isn't next to this script -- skipping "
+              "the data-only fixes. The exe patch is unaffected; ship both files together.")
+        return False
     mod_src = find_bundled_mod_dir()
     if mod_src is None:
         print("\n[SKIP] Bugfix mod: couldn't find a bundled 'mod/oisbugfix' folder next to this script -- "
@@ -1174,34 +1245,959 @@ def install_mod(exe_path):
 
 
 # ============================================================
+# Game install discovery
+#
+# Ported from Patch_OIS.bat's :DetectTarget / :ScanSteamRoot /
+# :TryLibrary, with the same search order, plus the things batch made
+# awkward and Python doesn't:
+#   - libraryfolders.vdf is parsed as key/value pairs rather than
+#     whitespace-split, so library paths containing spaces survive, and
+#     both the pre-2021 ("1" "D:\\Lib") and current (nested block with
+#     a "path" key) formats are understood.
+#   - the install folder name is read from Steam's own
+#     appmanifest_<appid>.acf when present, instead of assuming the
+#     literal string "Objects in Space".
+#   - GOG installs are searched too. The game has a DRM-free GOG
+#     release, which the Steam-only batch search cannot find at all.
+#   - every candidate is collected rather than stopping at the first
+#     hit, so two installs produce a question instead of a silent
+#     coin-flip about which one gets patched.
+# ============================================================
+
+GAME_EXE_NAME = "ois.exe"
+STEAM_APP_ID = "824070"
+STEAM_DEFAULT_DIR_NAME = "Objects in Space"
+TARGET_DIR_ENV = "OIS_TARGET_DIR"
+
+# Matches a "key" "value" pair in Valve's KeyValues text format, keeping
+# backslash escapes intact so they can be unescaped deliberately below.
+_VDF_PAIR = re.compile(r'"((?:[^"\\]|\\.)*)"[ \t]*"((?:[^"\\]|\\.)*)"')
+
+
+def _vdf_unescape(value):
+    return value.replace("\\\\", "\\").replace('\\"', '"')
+
+
+def _vdf_pairs(path):
+    """Yields (key, value) from a Valve KeyValues file. Missing or
+    unreadable files yield nothing -- a library entry that has been
+    deleted or is on a disconnected drive is normal, not an error."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for key, value in _VDF_PAIR.findall(text):
+        yield key, _vdf_unescape(value)
+
+
+def is_game_dir(path):
+    """A folder counts as an install only if ois.exe is in it.
+
+    Deliberately stricter than the batch file's :IsValidGameDir, which
+    also accepts an ois_server.exe-only folder. This script's whole
+    entry point is patching ois.exe; a folder without it would be
+    detected here only to fail two lines into main()."""
+    try:
+        return (Path(path) / GAME_EXE_NAME).is_file()
+    except OSError:
+        return False
+
+
+def normalize_user_path(raw):
+    """Accepts what people actually paste: surrounding quotes, stray
+    whitespace, a trailing separator, ~, or the path to ois.exe itself
+    rather than the folder holding it. Returns a Path or None."""
+    if raw is None:
+        return None
+    text = str(raw).strip().strip('"').strip("'").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.name.lower() == GAME_EXE_NAME:
+        path = path.parent
+    return path
+
+
+def _env_path(var):
+    value = os.environ.get(var)
+    if not value:
+        return None
+    value = value.strip().rstrip("\\/") or value.strip()
+    # SystemDrive is bare "C:", and Path("C:") / "Steam" means "Steam,
+    # relative to the current directory on C:" on Windows, not "C:\Steam".
+    if len(value) == 2 and value.endswith(":"):
+        value += "\\"
+    return Path(value)
+
+
+def _windows_registry_values(hive, subkey, value_names):
+    try:
+        import winreg
+    except ImportError:
+        return
+    try:
+        with winreg.OpenKey(hive, subkey) as key:
+            for name in value_names:
+                try:
+                    value, _ = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                if isinstance(value, str) and value.strip():
+                    yield value.strip()
+    except OSError:
+        return
+
+
+def _steam_roots():
+    """Steam client install folders, most likely first."""
+    if sys.platform == "win32":
+        for var in ("ProgramFiles(x86)", "ProgramFiles", "USERPROFILE", "SystemDrive"):
+            base = _env_path(var)
+            if base is not None:
+                yield base / "Steam"
+        try:
+            import winreg
+        except ImportError:
+            return
+        for hive, subkey, names in (
+            (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", ("SteamPath", "InstallPath")),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", ("InstallPath",)),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam", ("InstallPath",)),
+        ):
+            for value in _windows_registry_values(hive, subkey, names):
+                yield Path(value)
+    else:
+        # Not the intended platform, but the patcher itself is
+        # platform-agnostic (it edits a PE file on disk), so a Proton or
+        # Crossover install is patchable from the host side.
+        home = Path.home()
+        for rel in (
+            ".steam/steam",
+            ".steam/root",
+            ".local/share/Steam",
+            "Library/Application Support/Steam",
+            "snap/steam/common/.local/share/Steam",
+            ".var/app/com.valvesoftware.Steam/data/Steam",
+        ):
+            yield home / rel
+
+
+def _steam_libraries(steam_root):
+    """The root's own steamapps, plus every library listed in
+    libraryfolders.vdf (games are frequently on a different drive)."""
+    yield steam_root
+    for key, value in _vdf_pairs(steam_root / "steamapps" / "libraryfolders.vdf"):
+        # Current format keys the path as "path"; the old format keys it
+        # by library index ("1", "2", ...). The nested "apps" block is
+        # also index-keyed, but its values are byte counts, so anything
+        # purely numeric is not a library path.
+        if value.isdigit():
+            continue
+        if key.lower() == "path" or key.isdigit():
+            yield Path(value)
+
+
+def _steam_game_dirs(library):
+    """Candidate install folders inside one Steam library."""
+    steamapps = Path(library) / "steamapps"
+    names = []
+    for key, value in _vdf_pairs(steamapps / f"appmanifest_{STEAM_APP_ID}.acf"):
+        if key.lower() == "installdir" and value:
+            names.append(value)
+    names.append(STEAM_DEFAULT_DIR_NAME)  # fallback if the manifest is gone
+    for name in names:
+        yield steamapps / "common" / name
+
+
+def _gog_game_dirs():
+    """GOG Galaxy records each installed game's folder in the registry.
+    Every entry is enumerated and tested for ois.exe rather than looking
+    up a hardcoded product ID, so this keeps working if the ID is wrong
+    or the game was installed by the standalone offline installer."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+    except ImportError:
+        return
+    for subkey in (r"SOFTWARE\GOG.com\Games", r"SOFTWARE\WOW6432Node\GOG.com\Games"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as games:
+                index = 0
+                while True:
+                    try:
+                        child = winreg.EnumKey(games, index)
+                    except OSError:
+                        break
+                    index += 1
+                    for value in _windows_registry_values(
+                        winreg.HKEY_LOCAL_MACHINE, subkey + "\\" + child, ("path", "PATH", "exe")
+                    ):
+                        yield normalize_user_path(value)
+        except OSError:
+            continue
+    for base_var in ("SystemDrive", "ProgramFiles(x86)", "ProgramFiles"):
+        base = _env_path(base_var)
+        if base is None:
+            continue
+        yield base / "GOG Games" / STEAM_DEFAULT_DIR_NAME
+        yield base / "GOG Galaxy" / "Games" / STEAM_DEFAULT_DIR_NAME
+
+
+def _candidate_dirs():
+    """Yields (candidate_dir, source_label), unvalidated, in priority
+    order. Nothing here touches the disk except to read config files."""
+    for root in _steam_roots():
+        for library in _steam_libraries(root):
+            for game_dir in _steam_game_dirs(library):
+                yield game_dir, "Steam"
+    for game_dir in _gog_game_dirs():
+        if game_dir is not None:
+            yield game_dir, "GOG"
+
+
+def find_game_dirs():
+    """Every distinct install that actually contains ois.exe, in
+    priority order. Returns a list of (Path, source_label)."""
+    found = []
+    seen = set()
+    for candidate, source in _candidate_dirs():
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_game_dir(resolved):
+            found.append((resolved, source))
+    return found
+
+
+def _prompt_for_dir():
+    """Last resort, and only when someone is actually there to answer."""
+    if not sys.stdin.isatty():
+        return None
+    print("\nPlease paste your Objects in Space install folder.")
+    print(r"Example: D:\SteamLibrary\steamapps\common\Objects in Space")
+    for _ in range(3):
+        try:
+            raw = input("Game folder path (blank to give up): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        path = normalize_user_path(raw)
+        if path is None:
+            return None
+        if is_game_dir(path):
+            return path
+        print(f"[ERROR] No {GAME_EXE_NAME} in: {path}", file=sys.stderr)
+    return None
+
+
+def _choose_dir(found):
+    """More than one install is not a coin-flip: patching writes to
+    disk, so the choice gets made by whoever can actually see the
+    machine, not by search order."""
+    print(f"\nFound {len(found)} Objects in Space installs:")
+    for i, (path, source) in enumerate(found, 1):
+        print(f"  [{i}] {path}   ({source})")
+    if not sys.stdin.isatty():
+        print(
+            "\n[ERROR] Multiple installs found and nothing to prompt (not an interactive\n"
+            "        session). Re-run with the one you want:\n"
+            f"          python ois_patcher.py --game-dir \"{found[0][0]}\"",
+            file=sys.stderr,
+        )
+        return None
+    for _ in range(3):
+        try:
+            raw = input(f"Which one? [1-{len(found)}, or blank to cancel]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not raw:
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(found):
+            return found[int(raw) - 1][0]
+        print("[ERROR] Not one of the listed numbers.", file=sys.stderr)
+    return None
+
+
+def resolve_game_dir(explicit=None):
+    """Search order, mirroring Patch_OIS.bat:
+    explicit path (CLI) -> OIS_TARGET_DIR -> auto-detect -> ask.
+
+    An explicit path that turns out to be wrong is a hard error, not a
+    reason to start guessing: someone who names a folder means that
+    folder. A wrong OIS_TARGET_DIR only warns, since a stale environment
+    variable shouldn't block a detectable install. Returns a Path or
+    None."""
+    path = normalize_user_path(explicit)
+    if path is not None:
+        if is_game_dir(path):
+            return path
+        print(f"[ERROR] No {GAME_EXE_NAME} in the folder you gave: {path}", file=sys.stderr)
+        return None
+
+    path = normalize_user_path(os.environ.get(TARGET_DIR_ENV))
+    if path is not None:
+        if is_game_dir(path):
+            print(f"Using {TARGET_DIR_ENV}: {path}")
+            return path
+        print(f"[WARN] {TARGET_DIR_ENV} is set to {path}, which has no {GAME_EXE_NAME} -- ignoring it.")
+
+    print("Looking for your Objects in Space install...")
+    found = find_game_dirs()
+    if len(found) == 1:
+        print(f"Found install ({found[0][1]}): {found[0][0]}")
+        return found[0][0]
+    if len(found) > 1:
+        return _choose_dir(found)
+
+    print("[NOTICE] Could not find the game automatically.")
+    return _prompt_for_dir()
+
+
+# ============================================================
+# Install state: inspect, restore, uninstall
+#
+# The exe already carries an embedded version marker (see
+# VERSION_MARKER_* and read_version_marker), so "what is installed
+# right now" is a question the file itself can answer -- nothing here
+# relies on a sidecar receipt that can drift out of sync with reality.
+# ============================================================
+
+PATCHABLE_EXES = ("ois.exe", "ois_server.exe")
+MOD_DIR_RELATIVE = ("ObjectsInSpace", "mods", "oisbugfix")
+BACKUP_SUFFIX = ".original-backup"
+
+# state values from inspect_exe()
+STATE_MISSING = "missing"        # file isn't there
+STATE_UNREADABLE = "unreadable"  # there, but not a PE this tool understands
+STATE_STOCK = "stock"            # no .ptch section -- never patched by us
+STATE_PATCHED = "patched"        # .ptch present, version marker readable
+STATE_PATCHED_UNKNOWN = "patched-unknown"  # .ptch present, no readable marker
+
+
+class ExeStatus:
+    __slots__ = ("path", "state", "version")
+
+    def __init__(self, path, state, version=None):
+        self.path = path
+        self.state = state
+        self.version = version
+
+    @property
+    def is_patched(self):
+        return self.state in (STATE_PATCHED, STATE_PATCHED_UNKNOWN)
+
+    def describe(self):
+        return {
+            STATE_MISSING: "not present",
+            STATE_UNREADABLE: "unreadable (not a PE this tool understands)",
+            STATE_STOCK: "stock (unpatched)",
+            STATE_PATCHED: f"patched by v{self.version}",
+            STATE_PATCHED_UNKNOWN: "patched (by a build with no version marker)",
+        }[self.state]
+
+
+def backup_path_for(exe_path):
+    return Path(exe_path).with_name(Path(exe_path).name + BACKUP_SUFFIX)
+
+
+def inspect_exe(exe_path):
+    """Reads a file's patch state without modifying anything."""
+    exe_path = Path(exe_path)
+    if not exe_path.is_file():
+        return ExeStatus(exe_path, STATE_MISSING)
+    try:
+        data = bytearray(exe_path.read_bytes())
+        pe = load_pe(data)
+    except Exception:
+        # Anything unreadable is reported as such rather than raised: this
+        # runs from --status and from uninstall, where a bad file is a
+        # thing to report, not a crash.
+        return ExeStatus(exe_path, STATE_UNREADABLE)
+    try:
+        section = next((s for s in pe.sections if s.Name.rstrip(b"\x00") == b".ptch"), None)
+        if section is None:
+            return ExeStatus(exe_path, STATE_STOCK)
+        version = read_version_marker(data, pe, section)
+    finally:
+        pe.close()
+    if version is None:
+        return ExeStatus(exe_path, STATE_PATCHED_UNKNOWN)
+    return ExeStatus(exe_path, STATE_PATCHED, version)
+
+
+def parse_version(text):
+    """'0.3.2' -> (0, 3, 2). None when it isn't dotted integers, so a
+    hand-edited or future marker format degrades to 'different', never
+    to a false ordering."""
+    if not text:
+        return None
+    parts = text.strip().split(".")
+    if not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def ensure_writable(paths):
+    """A running game holds its own exe against writes on Windows, and
+    the same is true of a folder owned by another account. Both fail
+    much more clearly here than halfway through a rewrite."""
+    blocked = []
+    for path in paths:
+        path = Path(path)
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "r+b"):
+                pass
+        except OSError:
+            blocked.append(path)
+    if not blocked:
+        return True
+    print("\n[ERROR] These files cannot be written to right now:", file=sys.stderr)
+    for path in blocked:
+        print(f"  {path}", file=sys.stderr)
+    print("Close Objects in Space (and its server) if it's running, and make sure this\n"
+          "account can write to the game folder, then try again. Nothing has been changed.",
+          file=sys.stderr)
+    return False
+
+
+def check_backup_usable(backup):
+    """A backup is only worth restoring if it's a stock exe. Someone who
+    once copied a patched build over their backup would otherwise
+    'restore' to a patched file and then get patched again on top --
+    exactly the double-patch this tool refuses to do elsewhere."""
+    status = inspect_exe(backup)
+    if status.state == STATE_MISSING:
+        return False, "no backup file"
+    if status.state == STATE_UNREADABLE:
+        return False, "backup is not a readable PE file"
+    if status.is_patched:
+        return False, f"backup is itself {status.describe()} -- it is not a pristine original"
+    return True, None
+
+
+def restore_exe(exe_path, keep_backup=True):
+    """Copies <exe>.original-backup back over <exe>, verifies the result
+    byte-for-byte, and only then optionally removes the backup."""
+    exe_path = Path(exe_path)
+    backup = backup_path_for(exe_path)
+    usable, reason = check_backup_usable(backup)
+    if not usable:
+        print(f"  [SKIP] {exe_path.name}: {reason}", file=sys.stderr)
+        return False
+
+    original = backup.read_bytes()
+    exe_path.write_bytes(original)
+    if exe_path.read_bytes() != original:
+        print(f"  [ERROR] {exe_path.name}: restored file does not match the backup -- "
+              f"leaving the backup in place.", file=sys.stderr)
+        return False
+    print(f"  [OK] restored {exe_path.name}")
+
+    if not keep_backup:
+        try:
+            backup.unlink()
+            print(f"       removed {backup.name}")
+        except OSError as e:
+            print(f"       [WARN] could not remove {backup.name}: {e}")
+    return True
+
+
+def remove_mod(game_dir):
+    """Deletes the mod folder this tool installs. Refuses if what's there
+    doesn't look like it (no modinfo.txt), since this deletes a tree."""
+    mod_dir = Path(game_dir).joinpath(*MOD_DIR_RELATIVE)
+    if not mod_dir.exists():
+        print("  [SKIP] bugfix mod: not installed")
+        return False
+    if not (mod_dir / "modinfo.txt").is_file():
+        print(f"  [SKIP] bugfix mod: {mod_dir} has no modinfo.txt -- this doesn't look like "
+              f"the mod this tool installs, so it is being left alone. Delete it by hand "
+              f"if you're sure.")
+        return False
+    try:
+        shutil.rmtree(mod_dir)
+    except OSError as e:
+        print(f"  [ERROR] could not remove {mod_dir}: {e}", file=sys.stderr)
+        return False
+    print(f"  [OK] removed bugfix mod from {mod_dir}")
+    return True
+
+
+def print_status(game_dir):
+    game_dir = Path(game_dir)
+    print(f"Install: {game_dir}")
+    print(f"This patcher: v{PATCHER_VERSION}")
+    for name in PATCHABLE_EXES:
+        status = inspect_exe(game_dir / name)
+        backup = backup_path_for(game_dir / name)
+        backup_note = ""
+        if backup.is_file():
+            usable, reason = check_backup_usable(backup)
+            backup_note = "  [backup: available]" if usable else f"  [backup: unusable -- {reason}]"
+        else:
+            backup_note = "  [backup: none]"
+        print(f"  {name:<16} {status.describe()}{backup_note}")
+        if status.state == STATE_PATCHED and status.version != PATCHER_VERSION:
+            print(f"  {'':<16} -> run this script with no arguments to update it to v{PATCHER_VERSION}")
+    mod_dir = game_dir.joinpath(*MOD_DIR_RELATIVE)
+    print(f"  {'bugfix mod':<16} {'installed at ' + str(mod_dir) if mod_dir.is_dir() else 'not installed'}")
+
+
+def confirm(question, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("\n[ERROR] This needs a yes/no answer but there's nobody to ask (not an "
+              "interactive session). Re-run with --yes to confirm up front.", file=sys.stderr)
+        return False
+    try:
+        return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
+    """Puts the folder back the way it was: stock exes from the backups
+    this tool made, and the mod folder gone. `extra_exes` covers a
+    non-standard exe name the user named explicitly."""
+    game_dir = Path(game_dir)
+    targets = [game_dir / name for name in PATCHABLE_EXES]
+    for extra in extra_exes:
+        if Path(extra) not in targets:
+            targets.append(Path(extra))
+    mod_dir = game_dir.joinpath(*MOD_DIR_RELATIVE)
+
+    print(f"\nCurrent state of {game_dir}:")
+    restorable = []
+    for exe_path in targets:
+        status = inspect_exe(exe_path)
+        if status.state == STATE_MISSING:
+            continue
+        usable, reason = check_backup_usable(backup_path_for(exe_path))
+        print(f"  {exe_path.name:<16} {status.describe()}"
+              f"{'  [backup available]' if usable else '  [backup: ' + reason + ']'}")
+        if usable:
+            restorable.append(exe_path)
+        elif status.is_patched:
+            print(f"  {'':<16} -> cannot be reverted by this script. Use Steam's "
+                  f"\"Verify integrity of game files\" (or reinstall from GOG) to get a stock copy.")
+
+    mod_present = mod_dir.is_dir()
+    print(f"  {'bugfix mod':<16} {'installed' if mod_present else 'not installed'}")
+
+    if not restorable and not mod_present:
+        print("\nNothing installed by this script was found -- nothing to undo.")
+        return True
+
+    print("\nThis will:")
+    for exe_path in restorable:
+        print(f"  - restore {exe_path.name} from {backup_path_for(exe_path).name}"
+              f"{'' if keep_backups else ', then delete that backup'}")
+    if mod_present:
+        print(f"  - delete {mod_dir}")
+    print("  - leave save games, settings and every other game file untouched")
+
+    if not confirm("\nProceed?", assume_yes):
+        print("Uninstall canceled. Nothing was changed.")
+        return False
+
+    if not ensure_writable(restorable):
+        return False
+
+    print("\nUninstalling:")
+    ok = True
+    for exe_path in restorable:
+        ok = restore_exe(exe_path, keep_backup=keep_backups) and ok
+    if mod_present:
+        remove_mod(game_dir)
+
+    print("\n" + "=" * 60)
+    if ok:
+        print("Uninstall complete -- the game folder should match its pre-patch state.")
+    else:
+        print("Uninstall finished with problems (see above). The folder may now be a mix of\n"
+              "patched and stock files; verifying the game files through Steam or GOG is the\n"
+              "safest way back to a clean state.")
+    print("\nNote: this only undoes what ois_patcher.py did. Anything installed by\n"
+          "Patch_OIS.bat (its own Backup folder, OIS_Update.version.txt, firewall rules)\n"
+          "is separate -- run that script with -uninstall for those.")
+    return ok
+
+
+def prepare_for_patch(client_exe, force=False, assume_yes=False):
+    """Decides what a patch run should actually do, given what's already
+    installed. Returns one of:
+        "patch"     -- go ahead and patch the exes
+        "mod-only"  -- exes are already current; refresh the mod only
+        None        -- stop, reason already printed
+
+    Upgrading is a restore-then-patch, never a patch-on-top: the fixes
+    are byte-verified against stock code, so the only safe base for a
+    new version is the original file."""
+    client_exe = Path(client_exe)
+    client = inspect_exe(client_exe)
+    server = inspect_exe(client_exe.parent / "ois_server.exe")
+
+    if client.state == STATE_UNREADABLE:
+        print(f"\n[ERROR] {client_exe.name} is not a Windows executable this tool can read.\n"
+              f"        {client_exe}\n"
+              f'        Use Steam\'s "Verify integrity of game files" (or reinstall from GOG)\n'
+              f"        to get a good copy, then run this again.", file=sys.stderr)
+        return None
+
+    def is_current(status):
+        return status.state == STATE_PATCHED and status.version == PATCHER_VERSION
+
+    any_backup = any(backup_path_for(st.path).is_file()
+                     for st in (client, server) if st.state != STATE_MISSING)
+
+    # Ordinary first install: nothing here has been touched yet.
+    if not client.is_patched and not server.is_patched and not (force and any_backup):
+        return "patch"
+
+    # Everything that exists is already at this version. Note the server is
+    # checked too: a stale ois_server.exe beside a current ois.exe used to
+    # fall through to "already current", quietly leaving co-op unpatched.
+    server_ok = server.state == STATE_MISSING or is_current(server)
+    if is_current(client) and server_ok and not force:
+        print(f"\n{client_exe.name} is already patched by this exact version (v{PATCHER_VERSION}).")
+        print("Leaving it alone and refreshing the data-only mod instead "
+              "(pass --force to re-patch from the backup anyway).")
+        return "mod-only"
+
+    for status in (client, server):
+        if status.state == STATE_PATCHED and not is_current(status):
+            print(f"\n{status.path.name}: patched by v{status.version}")
+        elif status.state == STATE_PATCHED_UNKNOWN:
+            print(f"\n{status.path.name}: patched by a build with no version marker")
+
+    if client.state == STATE_PATCHED:
+        installed = parse_version(client.version)
+        current = parse_version(PATCHER_VERSION)
+        if installed and current and installed > current:
+            print(f"\n[ERROR] {client_exe.name} is patched by v{client.version}, which is NEWER than this "
+                  f"script (v{PATCHER_VERSION}).\n"
+                  f"        Continuing would downgrade it. Get the newer patcher, or pass "
+                  f"--force if you really mean to go back.", file=sys.stderr)
+            if not force:
+                return None
+        label = f"v{client.version}"
+    else:
+        label = "an unversioned build"
+
+    # Every exe that is patched (or that --force is about to re-patch)
+    # needs a usable backup before anything is touched.
+    to_restore = []
+    for status in (client, server):
+        if status.state == STATE_MISSING:
+            continue
+        if not status.is_patched and not force:
+            continue
+        if status.state == STATE_UNREADABLE:
+            print(f"\n[ERROR] {status.path.name} is not readable as a PE file; "
+                  f"not touching this install.", file=sys.stderr)
+            return None
+        usable, reason = check_backup_usable(backup_path_for(status.path))
+        if not usable:
+            print(f"\n[ERROR] {status.path.name} is {status.describe()}, but its backup can't be "
+                  f"used ({reason}).\n"
+                  f"        Updating means restoring the original first, so this can't proceed.\n"
+                  f"        Use Steam's \"Verify integrity of game files\" (or reinstall from GOG)\n"
+                  f"        to get a stock copy, then run this script again.", file=sys.stderr)
+            return None
+        to_restore.append(status.path)
+
+    if force and not client.is_patched:
+        print(f"\n--force: restoring from backup and re-patching from scratch.")
+    else:
+        print(f"\nThis install was patched by {label}; this script is v{PATCHER_VERSION}.")
+        print("Updating means restoring the original exe(s) from their backups and applying")
+        print("the current fixes to them. Save games and settings are not involved.")
+
+    if not confirm("\nUpdate now?", assume_yes):
+        print("Update canceled. Nothing was changed.")
+        return None
+
+    if not ensure_writable(to_restore):
+        return None
+
+    print("\nRestoring originals before re-patching:")
+    for exe_path in to_restore:
+        # The backups are kept: patching immediately follows, and main()
+        # reuses each one as the pristine original rather than re-making it.
+        if not restore_exe(exe_path, keep_backup=True):
+            print("[ERROR] Restore failed -- not patching on top of an unknown file.", file=sys.stderr)
+            return None
+    return "patch"
+
+
+# ============================================================
+# Self-update
+#
+# Two hard constraints shape this:
+#
+#   1. A pull replaces the very code that is running, including
+#      apply_data_fixes.py, which was imported at startup. Python does
+#      not reload either from disk mid-run, so pulling and then
+#      continuing would apply the OLD fixes while reporting the NEW
+#      version. Every successful pull therefore re-runs the script as a
+#      fresh process and exits; nothing continues in-process.
+#   2. Pulling is running someone else's new code on the user's
+#      machine. That gets asked about, not assumed. --yes deliberately
+#      does NOT imply consent here; --update does.
+# ============================================================
+
+REPO_URL = ""  # e.g. "https://github.com/you/ois-patcher" -- shown when git isn't usable
+UPDATED_ENV = "OIS_PATCHER_SELF_UPDATED"  # re-exec guard: one update per invocation
+
+
+def _git(args, cwd, timeout=30):
+    """Runs git, returning the CompletedProcess or None if git isn't
+    installed / didn't answer in time."""
+    try:
+        return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _manual_update_hint(reason):
+    """Silent when REPO_URL is unset: most people run this from a
+    downloaded zip, and telling them every single run that updates can't
+    be checked -- without being able to say where to look -- is noise,
+    not help."""
+    if not REPO_URL:
+        return
+    print(f"\n[NOTICE] Can't check for updates automatically ({reason}).")
+    print(f"         Check for a newer release at: {REPO_URL}")
+
+
+def check_for_updates(assume_update=False):
+    """Returns True if the script updated itself and re-ran (caller should
+    stop). Any failure here is a notice, never a reason to abort a patch
+    run -- being one commit behind is not a safety problem."""
+    if os.environ.get(UPDATED_ENV):
+        return False  # already re-ran once this invocation
+
+    here = Path(__file__).resolve().parent
+    top = _git(["rev-parse", "--show-toplevel"], here)
+    if top is None:
+        _manual_update_hint("git isn't installed or isn't on PATH")
+        return False
+    if top.returncode != 0:
+        _manual_update_hint("this copy isn't a git checkout -- probably a downloaded zip")
+        return False
+    repo = Path(top.stdout.strip())
+
+    # -uno: untracked files are ignored on purpose. Running this script
+    # writes __pycache__/ into its own directory, so counting untracked
+    # files as "local changes" would switch the update check off
+    # permanently after the very first run. Tracked edits still block it,
+    # and if an untracked file ever does collide with an incoming one,
+    # git's own ff-only pull refuses and that failure is handled below.
+    dirty = _git(["status", "--porcelain", "-uno"], repo)
+    if dirty is not None and dirty.returncode == 0 and dirty.stdout.strip():
+        print("\n[NOTICE] Skipping the update check: you have uncommitted local changes.")
+        print("         Updating would risk your edits, so this leaves the checkout alone.")
+        return False
+
+    upstream = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], repo)
+    if upstream is None or upstream.returncode != 0:
+        _manual_update_hint("this branch has no upstream to compare against")
+        return False
+
+    print("Checking for patcher updates...")
+    fetch = _git(["fetch", "--quiet"], repo, timeout=60)
+    if fetch is None or fetch.returncode != 0:
+        detail = (fetch.stderr.strip().splitlines() or ["no network, or the remote refused"])[-1] if fetch else "git fetch timed out"
+        print(f"[NOTICE] Update check failed ({detail}) -- continuing with the local version.")
+        return False
+
+    counts = _git(["rev-list", "--left-right", "--count", "HEAD...@{u}"], repo)
+    if counts is None or counts.returncode != 0:
+        print("[NOTICE] Could not compare against the remote -- continuing with the local version.")
+        return False
+    try:
+        ahead, behind = (int(n) for n in counts.stdout.split())
+    except ValueError:
+        print("[NOTICE] Could not read the remote comparison -- continuing with the local version.")
+        return False
+
+    if behind == 0:
+        print(f"Patcher is up to date (v{PATCHER_VERSION}).")
+        return False
+    if ahead:
+        print(f"\n[NOTICE] {behind} update(s) available, but this checkout also has {ahead} local "
+              f"commit(s).\n         A fast-forward isn't possible; merge or rebase by hand.")
+        return False
+
+    print(f"\n{behind} patcher update(s) available:")
+    log = _git(["log", "--oneline", "--no-decorate", "-10", "HEAD..@{u}"], repo)
+    if log is not None and log.returncode == 0:
+        for line in log.stdout.strip().splitlines():
+            print(f"  {line}")
+        if behind > 10:
+            print(f"  ... and {behind - 10} more")
+
+    if not confirm("\nUpdate the patcher now (git pull, then re-run)?", assume_update):
+        print("Continuing with the local version.")
+        return False
+
+    pull = _git(["pull", "--ff-only", "--quiet"], repo, timeout=120)
+    if pull is None or pull.returncode != 0:
+        detail = (pull.stderr.strip() if pull else "git pull timed out") or "unknown error"
+        print(f"\n[NOTICE] Update failed: {detail}\n         Continuing with the local version.")
+        return False
+
+    print("Updated. Re-running the patcher with the new version...\n")
+    env = dict(os.environ)
+    env[UPDATED_ENV] = "1"
+    # A fresh process, not os.execv: this keeps console behaviour sane on
+    # Windows and guarantees the new apply_data_fixes.py is the one imported.
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
+    sys.exit(result.returncode)
+
+
+# ============================================================
 # main
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Unofficial Objects in Space (ois.exe) bugfix patcher")
-    parser.add_argument("exe_path", help="Path to ois.exe (the game's client executable)")
+    parser = argparse.ArgumentParser(
+        description="Unofficial Objects in Space (ois.exe) bugfix patcher",
+        epilog="With no arguments, the game folder is detected automatically "
+               f"(Steam and GOG), falling back to the {TARGET_DIR_ENV} environment "
+               "variable and then to asking.",
+    )
+    parser.add_argument("exe_path", nargs="?",
+                        help=f"Path to {GAME_EXE_NAME}, or the folder containing it. "
+                             "Optional -- omit it to auto-detect.")
+    parser.add_argument("--game-dir", dest="game_dir", metavar="DIR",
+                        help="Same as passing the path positionally; provided because "
+                             "it reads better in scripts and shortcuts.")
+    parser.add_argument("--list-installs", action="store_true",
+                        help="List every install found and exit without patching anything.")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Restore the original exe(s) from their .original-backup files "
+                             "and remove the bugfix mod, then exit.")
+    parser.add_argument("--status", action="store_true",
+                        help="Report what is currently installed and exit without changing anything.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-patch from the backup even when the install is already current.")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Answer yes to confirmation prompts (for unattended runs).")
+    parser.add_argument("--update", action="store_true",
+                        help="Check the git checkout for a newer patcher and apply it without "
+                             "asking, then re-run.")
+    parser.add_argument("--no-update-check", action="store_true",
+                        help="Skip the update check entirely.")
+    parser.add_argument("--keep-backups", action="store_true",
+                        help="With --uninstall, leave the .original-backup files in place "
+                             "instead of deleting them after a verified restore.")
     args = parser.parse_args()
 
-    exe_path = Path(args.exe_path)
-    if not exe_path.is_file():
-        print(f"File not found: {exe_path}", file=sys.stderr)
+    if args.list_installs:
+        found = find_game_dirs()
+        if not found:
+            print("No Objects in Space install found.")
+            sys.exit(1)
+        for path, source in found:
+            print(f"{path}   ({source})")
+        sys.exit(0)
+
+    if args.exe_path and args.game_dir:
+        print("[ERROR] Give the path once, either positionally or as --game-dir, not both.",
+              file=sys.stderr)
         sys.exit(1)
 
-    backup_path = exe_path.with_name(exe_path.name + ".original-backup")
+    explicit = args.exe_path or args.game_dir
+    exe_path = None
+
+    # An explicitly named file that isn't ois.exe is taken at face value:
+    # before auto-detection existed, pointing this script at a renamed or
+    # copied-aside exe worked, and folder-based detection shouldn't
+    # quietly redirect such a run to the real ois.exe instead.
+    if explicit:
+        named = Path(str(explicit).strip().strip('"').strip("'")).expanduser()
+        if named.is_file() and named.name.lower() != GAME_EXE_NAME:
+            exe_path = named
+
+    if exe_path is None:
+        game_dir = resolve_game_dir(explicit)
+        if game_dir is None:
+            print('\nNo game folder found. Re-run with the path, e.g.:\n'
+                  '  python ois_patcher.py "D:\\SteamLibrary\\steamapps\\common\\Objects in Space"',
+                  file=sys.stderr)
+            sys.exit(1)
+        exe_path = game_dir / GAME_EXE_NAME
+    else:
+        game_dir = exe_path.parent
+
+    # Before anything is written. Skipped for read-only modes below unless
+    # asked for, so --status stays instant and offline.
+    if args.update or not (args.no_update_check or args.status):
+        check_for_updates(assume_update=args.update)
+
+    if args.status:
+        print_status(game_dir)
+        sys.exit(0)
+
+    if args.uninstall:
+        extra = [exe_path] if exe_path.name.lower() != GAME_EXE_NAME else []
+        sys.exit(0 if uninstall(game_dir, assume_yes=args.yes,
+                                keep_backups=args.keep_backups, extra_exes=extra) else 1)
+
+    action = prepare_for_patch(exe_path, force=args.force, assume_yes=args.yes)
+    if action is None:
+        sys.exit(1)
+
+    if action == "mod-only":
+        print("\nRefreshing data-only bugfix mod...")
+        mod_installed = install_mod(exe_path)
+        print(f"\nBugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
+        print("Exe fixes: already up to date, nothing changed.")
+        sys.exit(0)
+
+    print(f"\nPatching: {exe_path}")
+
+    if not ensure_writable([exe_path, game_dir / "ois_server.exe"]):
+        sys.exit(1)
+
+    # Read and validate first. Writing a backup of a file that turns out
+    # not to be patchable leaves confusing litter in the game folder and
+    # tells the user nothing useful.
+    try:
+        data = bytearray(exe_path.read_bytes())
+    except OSError as e:
+        print(f"\nCould not read {exe_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    ok, reason = validate_pe(data, exe_path.name)
+    if not ok:
+        print(f"\n[ERROR] {reason}", file=sys.stderr)
+        sys.exit(1)
+
+    backup_path = exe_path.with_name(exe_path.name + BACKUP_SUFFIX)
     if backup_path.exists():
         print(f"Backup already exists at {backup_path} -- not overwriting it (reusing it as the pristine original).")
     else:
-        backup_path.write_bytes(exe_path.read_bytes())
+        try:
+            backup_path.write_bytes(data)
+        except OSError as e:
+            print(f"\nCould not write the backup to {backup_path}: {e}\n"
+                  f"Refusing to patch without one.", file=sys.stderr)
+            sys.exit(1)
         print(f"Backed up original to {backup_path}")
-
-    data = bytearray(exe_path.read_bytes())
-
-    pe_check = load_pe(data)
-    if pe_check.OPTIONAL_HEADER.ImageBase != IMAGE_BASE:
-        pe_check.close()
-        print(f"Unexpected ImageBase {hex(pe_check.OPTIONAL_HEADER.ImageBase)} -- this doesn't look like the expected ois.exe build.", file=sys.stderr)
-        sys.exit(1)
-    pe_check.close()
 
     print("\nAdding patch section...")
     try:
@@ -1251,11 +2247,9 @@ def main():
     print(f"Bugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
     print(f"\nPatched: {exe_path}")
     print(f"Original backed up at: {backup_path}")
-    print("To revert the exe: copy the .original-backup file back over ois.exe.")
-    if server_patched:
-        print("To revert ois_server.exe: copy its .original-backup file back over it.")
-    if mod_installed:
-        print("To remove the mod: delete the 'oisbugfix' folder from ObjectsInSpace/mods/.")
+    print("To undo everything (exe(s) restored, mod removed):")
+    print("  python ois_patcher.py --uninstall")
+    print("To see what's installed at any time: python ois_patcher.py --status")
 
 
 if __name__ == "__main__":
