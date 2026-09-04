@@ -529,6 +529,8 @@ non-commercial purposes, as long as you credit the original author
   writable (e.g. the game isn't currently running) before making any
   changes, rather than partway through.
 
+( credit to Voidless7125 for this amazing usability update! )
+
 ### 0.3.3 - 2026-09-01
 
 - Fixed the GRA 5 grappling arm installing non-functional and unsellable when bought in Stealth or Low Power Use condition — its data was missing 8 of 10 components in those two states (issue #7).
