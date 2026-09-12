@@ -87,6 +87,18 @@ Applies (all client-only, ois.exe):
     (third-party) rendering engine and crash. Rather than patch that
     engine DLL, this ignores the "open PDA" input for that instant
     instead -- pressing it again immediately after works normally.
+  - Full Stop docked-state exploit: triggering Full Stop while docked
+    silently undocks the ship in every system's eyes except the game's
+    own dock/undock bookkeeping -- no fee, no undocking permission
+    check, no airlock requirement, because the real Undock command
+    never runs.
+  - Save-load crash (or hang) on a module identifier that no longer
+    resolves -- e.g. a save or hand-edited ship data still referencing
+    a module id this same project's own LADAR rename retired. Two
+    independent bugs fixed together: a missing null-check on the
+    result of resolving the identifier, and a save-file read-position
+    desync in the failure path that otherwise turns the crash into a
+    hang instead of actually fixing it.
 
 Applies to ois_server.exe (ships alongside ois.exe in every Windows
 Steam install):
@@ -143,7 +155,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.3.4"
+PATCHER_VERSION = "0.3.5"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
@@ -1043,6 +1055,180 @@ def fix_del_command(data, pe, ptch_va, ptch_off, cave_cursor):
     data[protected_jmp_off:protected_jmp_off + 5] = new_protected_jmp
 
     cave_cursor += len(cave4)
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 10: Full Stop, while docked, silently undocks the ship in every
+# system's eyes except the game's own dock/undock bookkeeping (BUG-022).
+# Ship::allStop unconditionally clears the docking-process state field as
+# part of "come to a stop" -- every system gated on the general
+# ShipData::checkIsDocked/checkNotDocked predicate (reactor start, waypoint
+# plotting, plausibly more) immediately starts behaving as if the ship
+# weren't docked, with no fee, no undocking permission check, and no
+# airlock requirement ever evaluated, because the real Undock command never
+# runs. Fix: skip that one write when the ship is still genuinely docked
+# (checked via ship+0x178, the real docked-with pointer, confirmed via live
+# repro to stay unchanged throughout the exploit) -- every other caller of
+# allStop on a genuinely non-docked ship is unaffected.
+# ============================================================
+
+def fix_allstop_docked_writeguard(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Full Stop while docked silently undocks the ship (no fee/permission/airlock check)"
+    PATCH_SITE_VA, RESUME_VA = 0x00519666, 0x00519670
+    DOCKED_WITH_CHECK = bytes([0x83, 0xBE, 0x78, 0x01, 0x00, 0x00, 0x00])  # CMP dword ptr[ESI+0x178],0
+
+    expected = bytes([0xC7, 0x86, 0xD4, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])
+    off = verify_site(data, pe, PATCH_SITE_VA, expected, label)
+    if off is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    neutralize_relocations(data, pe, PATCH_SITE_VA, len(expected), label)
+
+    cave = bytearray()
+    def emit(b): cave.extend(b)
+
+    emit(DOCKED_WITH_CHECK)
+    jne_pos = len(cave)
+    emit(bytes([0x75, 0]))
+    emit(expected)
+    skip_pos = len(cave)
+    jmp_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))
+
+    cave_va = ptch_va + cave_cursor
+    jne_rel8 = skip_pos - (jne_pos + 2)
+    assert -128 <= jne_rel8 <= 127
+    cave[jne_pos + 1] = jne_rel8 & 0xFF
+    struct.pack_into("<i", cave, jmp_pos + 1, RESUME_VA - (cave_va + jmp_pos + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+
+    redirect = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect, 1, cave_va - (PATCH_SITE_VA + 5))
+    redirect += b"\x90" * (len(expected) - len(redirect))
+    data[off:off + len(expected)] = redirect
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
+# Fix 11: a save (or hand-edited ship data) referencing a module identifier
+# that no longer resolves -- e.g. the pre-rename LADAR ids this same
+# project's own BUG-018 fix renamed -- crashes on load, or (with only half
+# this fix applied) hangs instead (BUG-023). Two independent bugs, both
+# needed together:
+#
+#   (a) V12::loadShip dereferences V10::readShipModule's return value with
+#       no null check -- an unresolvable identifier is a guaranteed
+#       NULL-pointer crash.
+#   (b) V10::readShipModule's own failure path (which already correctly
+#       detects and logs the bad identifier) returns immediately after
+#       just the identifier string, never consuming the 339 bytes of
+#       trailing per-module data a resolved module's read would have --
+#       permanently desyncing the save file's read position for every
+#       remaining module and everything read after it. Fixing only (a)
+#       replaces the crash with a hang instead (confirmed live) as the
+#       desync cascades into a corrupted downstream loop count.
+#
+# Fixing both: the ship simply loads with that one module slot left empty,
+# everything else -- remaining modules, contracts, gameplay -- unaffected.
+# ============================================================
+
+def fix_readshipmodule_unresolvable_identifier(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Save-load crash/hang when a module identifier no longer resolves"
+
+    # --- (a): null-check the resolved module pointer before using it ---
+    PATCH_SITE_VA, RESUME_VA, CONTINUE_VA = 0x004bf657, 0x004bf65c, 0x004bf67d
+    expected = bytes([0x8B, 0xF0, 0x8A, 0x46, 0x63])
+    off = verify_site(data, pe, PATCH_SITE_VA, expected, label + " (null-check site)")
+    if off is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    cave = bytearray()
+    def emit(b): cave.extend(b)
+
+    emit(bytes([0x8B, 0xF0]))
+    emit(bytes([0x85, 0xF6]))
+    jne_pos = len(cave)
+    emit(bytes([0x75, 0]))
+    jmp_continue_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))
+    not_null_pos = len(cave)
+    emit(bytes([0x8A, 0x46, 0x63]))
+    jmp_resume_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))
+
+    cave_va = ptch_va + cave_cursor
+    jne_rel8 = not_null_pos - (jne_pos + 2)
+    assert -128 <= jne_rel8 <= 127
+    cave[jne_pos + 1] = jne_rel8 & 0xFF
+    struct.pack_into("<i", cave, jmp_continue_pos + 1, CONTINUE_VA - (cave_va + jmp_continue_pos + 5))
+    struct.pack_into("<i", cave, jmp_resume_pos + 1, RESUME_VA - (cave_va + jmp_resume_pos + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+
+    redirect = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect, 1, cave_va - (PATCH_SITE_VA + 5))
+    assert len(redirect) == len(expected)
+    data[off:off + len(expected)] = redirect
+
+    cave_cursor += len(cave)
+
+    # --- (b): keep the save file's read position in sync on that same
+    # failure path, by discard-reading the same 339 bytes a resolved
+    # module's read would have consumed ---
+    PATCH_SITE_VA2, EXIT_VA2 = 0x004c07ee, 0x004c0a0e
+    FREAD_IAT_VA = 0x005cf288  # confirmed via pefile's own import table
+    DISCARD_SIZE = 339
+
+    expected2 = bytes([0x33, 0xDB, 0xE9]) + struct.pack("<i", EXIT_VA2 - (PATCH_SITE_VA2 + 2 + 5))
+    off2 = verify_site(data, pe, PATCH_SITE_VA2, expected2, label + " (stream-sync site)")
+    if off2 is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    cave2 = bytearray()
+    def emit2(b): cave2.extend(b)
+
+    call_pos = len(cave2)
+    emit2(bytes([0xE8, 0, 0, 0, 0]))
+    emit2(bytes([0x58]))
+    add_pos = len(cave2)
+    emit2(bytes([0x05, 0, 0, 0, 0]))
+    emit2(bytes([0x81, 0xEC]) + struct.pack("<I", DISCARD_SIZE))
+    emit2(bytes([0x8B, 0xCC]))
+    emit2(bytes([0x53]))
+    emit2(bytes([0x6A, 0x01]))
+    emit2(bytes([0x68]) + struct.pack("<I", DISCARD_SIZE))
+    emit2(bytes([0x51]))
+    emit2(bytes([0xFF, 0x10]))
+    emit2(bytes([0x83, 0xC4, 0x10]))
+    emit2(bytes([0x81, 0xC4]) + struct.pack("<I", DISCARD_SIZE))
+    emit2(bytes([0x33, 0xDB]))
+    jmp_pos2 = len(cave2)
+    emit2(bytes([0xE9, 0, 0, 0, 0]))
+
+    cave_va2 = ptch_va + cave_cursor
+    anchor_va = cave_va2 + call_pos + 5
+    struct.pack_into("<i", cave2, add_pos + 1, FREAD_IAT_VA - anchor_va)
+    struct.pack_into("<i", cave2, jmp_pos2 + 1, EXIT_VA2 - (cave_va2 + jmp_pos2 + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave2)] = cave2
+
+    redirect2 = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect2, 1, cave_va2 - (PATCH_SITE_VA2 + 5))
+    redirect2 += b"\x90" * (len(expected2) - len(redirect2))
+    data[off2:off2 + len(expected2)] = redirect2
+
+    cave_cursor += len(cave2)
 
     print(f"  [OK] {label}")
     FIXES_APPLIED.append(label)
@@ -2224,6 +2410,8 @@ def main():
     fix_unknown_room_spam(data, pe)
     cave_cursor = fix_pda_render_guard(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_del_command(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_allstop_docked_writeguard(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_readshipmodule_unresolvable_identifier(data, pe, ptch_va, ptch_off, cave_cursor)
     pe.close()
 
     if cave_cursor > ptch_size:
