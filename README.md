@@ -445,6 +445,23 @@ before:
   network packet field; the resulting mangled identifier failed to
   resolve with no fallback. Fixed by shortening both ids. (Mod-only
   fix, no exe patch needed.)
+- **Full Stop, while docked, lets you fly away for free** — triggering
+  Full Stop while docked cleared the same internal field every other
+  system checks to tell if a ship is docked, without the real Undock
+  command ever running — so the ship could immediately start its
+  reactor, plot a course, and leave with no undocking fee, no
+  permission check, and no requirement to close the airlock first. The
+  ship's actual docked-with relationship (used by everything else,
+  including the real Undock command) is untouched by this fix.
+- **A save (or hand-edited ship data) referencing a retired module
+  identifier crashes the game on load** — including this same patch's
+  own earlier LADAR identifier shortening, if an existing save still
+  references a module by its old, longer id. Two independent bugs
+  fixed together: a missing check let the crash happen at all, and a
+  save-file read-position bug (already latent, just never triggered
+  by anything reaching it) would have turned that crash into a hang
+  instead if only the first were fixed. With both fixed, the ship
+  loads normally with that one module slot left empty.
 
 ## Limitations
 
@@ -481,6 +498,19 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.5 - 2026-09-12
+
+- **New fix: Full Stop docked-state exploit.** Triggering Full Stop
+  while docked no longer lets the ship fly away for free — the write
+  that made every other system think the ship had undocked is now
+  skipped while it's still genuinely docked.
+- **New fix: save-load crash/hang on a retired module identifier.** A
+  save (or hand-edited ship data) referencing a module id that no
+  longer resolves — including this patch's own earlier LADAR id
+  shortening — now loads normally with that module slot left empty,
+  instead of crashing or, with only half the underlying bug fixed,
+  hanging instead.
 
 ### 0.3.4 - 2026-09-02
 
