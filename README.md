@@ -462,6 +462,35 @@ before:
   by anything reaching it) would have turned that crash into a hang
   instead if only the first were fixed. With both fixed, the ship
   loads normally with that one module slot left empty.
+- **Commodities Trading Terminal shows a garbled error buying a
+  shielded/temperature-controlled good with no pod space left** — the
+  pod type name and the market-price note were being substituted into
+  the wrong slots of the error message, so text like "radiation
+  shielded" ended up jammed in front of "Error:" and the price note
+  ended up stuck in the middle of "not enough ___ space in your hold."
+  Now shows the intended, readable message.
+- **"Quit to OS"/"Quit to Menu" never close the game while connected as
+  a LAN client** — clicking either button from an active client session
+  silently routed the command to the server instead of running it
+  locally, so the server shut down cleanly while your own client sat
+  frozen on the pause menu forever, needing a force-kill from Task
+  Manager/Steam every time. Both commands now disconnect properly and
+  close/return to the menu on the client itself, exactly like they
+  already do in singleplayer.
+- **Client crash dragging an installed addon between module slots in the
+  engineering repair screen** — only shield and adapter components use
+  the addon-slot mechanism this bug lives in, and both are content the
+  developers themselves disabled — you can't normally obtain one through
+  regular play, so most players will never encounter this. The drag's
+  source slot index was never bounds-checked (only the destination was),
+  so dragging one from its addon-icon slot could read 400+ bytes past the
+  module's component array and crash on the garbage it found there. That
+  specific addon-to-addon/addon-to-main move was never implemented for
+  any slot in the first place, so this fix just rejects it cleanly
+  (silently ignored, matching what already happens when the
+  *destination* is an addon slot) instead of crashing. **This does not
+  re-enable or restore shield components** — it only stops the crash if
+  one is ever present.
 
 ## Limitations
 
@@ -498,6 +527,23 @@ non-commercial purposes, as long as you credit the original author
 (Leeway). See [LICENSE](LICENSE) for the full terms.
 
 ## Version history
+
+### 0.3.6 - 2026-09-24
+
+- **New fix: garbled trading-terminal error for shielded/temperature-
+  controlled goods.** Buying a good that needs a special cargo pod (e.g.
+  Radioactive Waste) with not enough free pod space used to show a
+  scrambled message with the pod type name and a price note mashed into
+  the wrong places. Now shows the intended, readable error.
+- **New fix: "Quit to OS"/"Quit to Menu" never closing the game as a LAN
+  client.** Both buttons now actually disconnect and close/return to the
+  menu on the client, instead of silently doing nothing and leaving you
+  to force-kill the process every time.
+- **New fix: crash dragging an installed addon between module slots** in
+  the engineering repair screen. Only affects shield/adapter components
+  (content the developers already disabled, so most players will never
+  hit this) — that move was never implemented for any slot, so it's now
+  cleanly rejected instead of crashing. Doesn't re-enable shields.
 
 ### 0.3.5 - 2026-09-12
 

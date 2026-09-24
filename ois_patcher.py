@@ -155,7 +155,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.3.5"
+PATCHER_VERSION = "0.3.6"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
@@ -1229,6 +1229,298 @@ def fix_readshipmodule_unresolvable_identifier(data, pe, ptch_va, ptch_off, cave
     data[off2:off2 + len(expected2)] = redirect2
 
     cave_cursor += len(cave2)
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 12: Commodities Trading Terminal shows a garbled "not enough pod
+# space" error for a good that needs a special cargo pod (radiation-shielded
+# or temperature-controlled) when there isn't enough free space in it.
+#
+# TradeEngine::currentCommodityPurchaseValid has two call sites for this
+# error that use a two-`%s` format string ("%s`^Error: not enough `!%s
+# `^space in your hold."). Both push the pod-type-name lookup and the
+# market-price-comparison note in the wrong order for cdecl's right-to-left
+# argument convention: the pod name lands in the leading `%s` (prepended
+# before "Error:") and the price note lands inside "not enough ___ space in
+# your hold." where the pod name belongs. A simpler sibling call site in the
+# same function (single-`%s` template, used in an earlier pre-price check)
+# puts the pod name in the right slot, confirming that's the intended
+# position.
+#
+# Can't just reorder the two existing PUSH instructions in place: the
+# pod-name table lookup (PUSH dword ptr [reg*4+0x5dfa98]) embeds an
+# absolute address with its own base-relocation entry, and physically
+# moving it to a new file offset would leave that entry pointing at the
+# wrong bytes. Instead, cave-replace both push sequences with a
+# PIC-addressed version (the usual CALL $+5/POP/ADD trick to get the
+# table's base into a scratch register, then a register-relative
+# [base_reg + index_reg*4] dereference -- no embedded absolute address, so
+# no new relocation entry needed) that pushes the two values in the
+# corrected order. See BUGS.md BUG-029 and docs/trading-terminal.md.
+# ============================================================
+
+def fix_trade_pod_error_args(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Trading terminal garbled error when a shielded/temp-controlled good won't fit"
+    TABLE_VA = 0x005dfa98  # pod-type-name string lookup table
+
+    # --- site 1: strUsingArgs call site (builds the error into a member
+    # string without an immediate on-screen display) ---
+    SITE1_VA, SITE1_RESUME_VA = 0x0048a50f, 0x0048a517
+    expected1 = bytes([
+        0x50,                                       # PUSH EAX               (price note)
+        0xFF, 0x34, 0x8D, 0x98, 0xFA, 0x5D, 0x00,   # PUSH dword ptr [ECX*4+0x5dfa98]  (pod name)
+    ])
+    off1 = verify_site(data, pe, SITE1_VA, expected1, label + " (site 1)")
+    if off1 is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    # --- site 2: TextEngine::addLinef call site (displays immediately) ---
+    SITE2_VA, SITE2_RESUME_VA = 0x0048a578, 0x0048a583
+    expected2 = bytes([
+        0x50,                                       # PUSH EAX               (price note)
+        0x8B, 0x47, 0x5C,                           # MOV EAX,[EDI+0x5c]     (pod-type index)
+        0xFF, 0x34, 0x85, 0x98, 0xFA, 0x5D, 0x00,   # PUSH dword ptr [EAX*4+0x5dfa98]  (pod name)
+    ])
+    off2 = verify_site(data, pe, SITE2_VA, expected2, label + " (site 2)")
+    if off2 is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    neutralize_relocations(data, pe, SITE1_VA, len(expected1), label + " (site 1)")
+    neutralize_relocations(data, pe, SITE2_VA, len(expected2), label + " (site 2)")
+
+    # --- cave 1 ---
+    cave1 = bytearray()
+    def emit1(b): cave1.extend(b)
+
+    call_pos1 = len(cave1)
+    emit1(bytes([0xE8, 0, 0, 0, 0]))            # CALL $+5
+    next1_off = len(cave1)
+    emit1(bytes([0x5A]))                         # POP EDX -> PIC anchor
+    add_pos1 = len(cave1)
+    emit1(bytes([0x81, 0xC2, 0, 0, 0, 0]))       # ADD EDX, delta -> EDX = TABLE_VA
+    emit1(bytes([0xFF, 0x34, 0x8A]))             # PUSH dword ptr [EDX+ECX*4]  (pod name, pushed first)
+    emit1(bytes([0x50]))                         # PUSH EAX                    (price note, pushed second)
+    jmp_pos1 = len(cave1)
+    emit1(bytes([0xE9, 0, 0, 0, 0]))             # JMP SITE1_RESUME_VA
+
+    cave1_va = ptch_va + cave_cursor
+    struct.pack_into("<i", cave1, call_pos1 + 1, 0)
+    struct.pack_into("<i", cave1, add_pos1 + 2, TABLE_VA - (cave1_va + next1_off))
+    struct.pack_into("<i", cave1, jmp_pos1 + 1, SITE1_RESUME_VA - (cave1_va + jmp_pos1 + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave1)] = cave1
+    cave_cursor += len(cave1)
+
+    redirect1 = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect1, 1, cave1_va - (SITE1_VA + 5))
+    redirect1 += b"\x90" * (len(expected1) - len(redirect1))
+    data[off1:off1 + len(expected1)] = redirect1
+
+    # --- cave 2 ---
+    cave2 = bytearray()
+    def emit2(b): cave2.extend(b)
+
+    emit2(bytes([0x8B, 0x4F, 0x5C]))             # MOV ECX,[EDI+0x5c]  (pod-type index)
+    call_pos2 = len(cave2)
+    emit2(bytes([0xE8, 0, 0, 0, 0]))             # CALL $+5
+    next2_off = len(cave2)
+    emit2(bytes([0x5A]))                          # POP EDX -> PIC anchor
+    add_pos2 = len(cave2)
+    emit2(bytes([0x81, 0xC2, 0, 0, 0, 0]))        # ADD EDX, delta -> EDX = TABLE_VA
+    emit2(bytes([0xFF, 0x34, 0x8A]))              # PUSH dword ptr [EDX+ECX*4]  (pod name, pushed first)
+    emit2(bytes([0x50]))                          # PUSH EAX                    (price note, pushed second)
+    jmp_pos2 = len(cave2)
+    emit2(bytes([0xE9, 0, 0, 0, 0]))              # JMP SITE2_RESUME_VA
+
+    cave2_va = ptch_va + cave_cursor
+    struct.pack_into("<i", cave2, call_pos2 + 1, 0)
+    struct.pack_into("<i", cave2, add_pos2 + 2, TABLE_VA - (cave2_va + next2_off))
+    struct.pack_into("<i", cave2, jmp_pos2 + 1, SITE2_RESUME_VA - (cave2_va + jmp_pos2 + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave2)] = cave2
+    cave_cursor += len(cave2)
+
+    redirect2 = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect2, 1, cave2_va - (SITE2_VA + 5))
+    redirect2 += b"\x90" * (len(expected2) - len(redirect2))
+    data[off2:off2 + len(expected2)] = redirect2
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 13: "Quit to OS"/"Quit to Menu" never actually close/exit the game
+# when connected as a LAN client -- the pause-menu click handler
+# (Screen_Custom::clickOnObject) routes every command to the server while
+# networked, and QUIT_TO_MENU/QUIT_TO_OS were never carved out of that
+# routing even though they're purely client-local UI actions. The server
+# runs its own local quit handler and shuts down cleanly (hence it looking
+# "fixed" from the server side), but the client that actually clicked the
+# button never runs its own handler and just sits on the pause menu.
+#
+# Fix: check the clicked command's id right where the function commits to
+# the "networked, send to server" branch. For QUIT_TO_MENU (0xc2) or
+# QUIT_TO_OS (0xc3), disconnect from the server first (via
+# NetworkClient::disconnectFromServer directly -- the "official"
+# doDisconnectFromServer wrapper gates on a UI submenu flag that's
+# irrelevant here and silently no-ops from the plain pause menu), then jump
+# into the same local-dispatch path the function already uses when not
+# networked at all. Every other command id falls through to the original
+# send-to-server behavior, byte for byte unchanged. See BUGS.md BUG-012.
+# ============================================================
+
+def fix_quit_networked_disconnect(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Quit to OS/Menu never closes the game while connected as a LAN client"
+    PATCH_SITE_VA = 0x005461bc
+    NOT_NETWORKED_LOCAL_DISPATCH_VA = 0x0054620e
+    ORIGINAL_FALLBACK_TAKEN_VA = 0x005461d4
+    ORIGINAL_FALLBACK_NOTTAKEN_VA = 0x005461c5
+    GET_NETWORKCLIENT_INSTANCE_VA = 0x00402550
+    NETWORKCLIENT_DISCONNECT_VA = 0x0041b170
+    SINGLETON_CACHE_VA = 0x0065e400
+    QUIT_TO_MENU_CMD_ID = 0xc2
+    QUIT_TO_OS_CMD_ID = 0xc3
+
+    expected = bytes([0x83, 0x3D, 0x00, 0xE4, 0x65, 0x00, 0x00, 0x75, 0x0F])
+    off = verify_site(data, pe, PATCH_SITE_VA, expected, label)
+    if off is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    # the original CMP embeds SINGLETON_CACHE_VA as an absolute address
+    # (within the first 7 of these 9 bytes) -- has its own reloc entry
+    neutralize_relocations(data, pe, PATCH_SITE_VA, 7, label)
+
+    cave = bytearray()
+    def emit(b): cave.extend(b)
+
+    cave_va = ptch_va + cave_cursor
+
+    anchor_pos = len(cave)
+    emit(bytes([0xE8, 0, 0, 0, 0]))            # CALL $+5
+    emit(bytes([0x5A]))                         # POP EDX -> PIC anchor
+    anchor_va = cave_va + anchor_pos + 5
+    delta_sub_pos = len(cave)
+    emit(bytes([0x81, 0xEA, 0, 0, 0, 0]))       # SUB EDX, anchor_va -> EDX = runtime delta
+    struct.pack_into("<i", cave, delta_sub_pos + 2, anchor_va)
+
+    emit(bytes([0x8B, 0x84, 0x3E, 0x28, 0x01, 0x00, 0x00]))  # MOV EAX,[ESI+EDI*1+0x128] (clicked cmd id)
+
+    do_quit_fixups = []
+    emit(bytes([0x3D]) + struct.pack("<I", QUIT_TO_MENU_CMD_ID))  # CMP EAX, 0xc2
+    jz1_pos = len(cave)
+    emit(bytes([0x0F, 0x84, 0, 0, 0, 0]))       # JZ do_quit
+    do_quit_fixups.append(jz1_pos)
+
+    emit(bytes([0x3D]) + struct.pack("<I", QUIT_TO_OS_CMD_ID))    # CMP EAX, 0xc3
+    jz2_pos = len(cave)
+    emit(bytes([0x0F, 0x84, 0, 0, 0, 0]))       # JZ do_quit
+    do_quit_fixups.append(jz2_pos)
+
+    # not a quit command: replay the original two instructions, PIC-corrected
+    emit(bytes([0x8D, 0x8A]) + struct.pack("<i", SINGLETON_CACHE_VA))  # LEA ECX,[EDX+SINGLETON_CACHE_VA]
+    emit(bytes([0x83, 0x39, 0x00]))             # CMP dword ptr [ECX],0
+    jnz_fallback_pos = len(cave)
+    emit(bytes([0x0F, 0x85, 0, 0, 0, 0]))       # JNZ ORIGINAL_FALLBACK_TAKEN_VA
+    jmp_fallback_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))             # JMP ORIGINAL_FALLBACK_NOTTAKEN_VA
+
+    # do_quit: disconnect from the server, then run the existing local-dispatch path
+    do_quit_pos = len(cave)
+    getinstance_call_pos = len(cave)
+    emit(bytes([0xE8, 0, 0, 0, 0]))             # CALL GET_NETWORKCLIENT_INSTANCE_VA
+    emit(bytes([0x8B, 0xC8]))                    # MOV ECX, EAX
+    disconnect_call_pos = len(cave)
+    emit(bytes([0xE8, 0, 0, 0, 0]))             # CALL NETWORKCLIENT_DISCONNECT_VA
+    jmp_local_dispatch_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))             # JMP NOT_NETWORKED_LOCAL_DISPATCH_VA
+
+    for pos in do_quit_fixups:
+        struct.pack_into("<i", cave, pos + 2, (cave_va + do_quit_pos) - (cave_va + pos + 6))
+    struct.pack_into("<i", cave, jnz_fallback_pos + 2, ORIGINAL_FALLBACK_TAKEN_VA - (cave_va + jnz_fallback_pos + 6))
+    struct.pack_into("<i", cave, jmp_fallback_pos + 1, ORIGINAL_FALLBACK_NOTTAKEN_VA - (cave_va + jmp_fallback_pos + 5))
+    struct.pack_into("<i", cave, getinstance_call_pos + 1, GET_NETWORKCLIENT_INSTANCE_VA - (cave_va + getinstance_call_pos + 5))
+    struct.pack_into("<i", cave, disconnect_call_pos + 1, NETWORKCLIENT_DISCONNECT_VA - (cave_va + disconnect_call_pos + 5))
+    struct.pack_into("<i", cave, jmp_local_dispatch_pos + 1, NOT_NETWORKED_LOCAL_DISPATCH_VA - (cave_va + jmp_local_dispatch_pos + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    cave_cursor += len(cave)
+
+    redirect = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect, 1, cave_va - (PATCH_SITE_VA + 5))
+    data[off:off + 5] = redirect
+    data[off + 5:off + 7] = bytes([0x90, 0x90])  # NOP the 2 leftover bytes of the clobbered CMP;
+                                                   # the original JNZ at +7 stays but is now dead code
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 14: client crashes intermittently while dragging an installed addon
+# from one component's addon slot onto another slot in the engineering
+# repair screen. ShipInterface::doEngMoveComponent bounds-checks its
+# destination slot index but not its source, which UI_ModuleRepair::
+# dragOnto encodes the same way (main_slot_index + 100 for an addon-slot
+# icon) -- an addon-sourced drag lets an unchecked index 400+ bytes past
+# the module's 20-slot main-component array get read as a component
+# pointer and dereferenced, the actual crash.
+#
+# An addon-to-* move isn't implemented anywhere in this function (it only
+# ever touches the main-component array), so the correct, minimal fix
+# mirrors what the destination side already does when *it's* addon-encoded:
+# reject cleanly, no error message, no sound -- not a feature add, just
+# closing the same gap the destination side was already closed on. See
+# BUGS.md BUG-027 and docs/module-repair-system.md.
+# ============================================================
+
+def fix_addon_move_oob(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Crash dragging an installed addon between module slots (repair screen)"
+    PATCH_SITE_VA = 0x004e103b
+    RESUME_VA = 0x004e1041   # source < 100: stock code continues exactly as compiled
+    SKIP_VA = 0x004e1144     # source >= 100: same shared tail the dest>=100 check already uses
+
+    expected = bytes([
+        0x8B, 0x4E, 0x0C,   # MOV ECX,[ESI+0xc]
+        0x8D, 0x42, 0x01,   # LEA EAX,[EDX+0x1]
+    ])
+    off = verify_site(data, pe, PATCH_SITE_VA, expected, label)
+    if off is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+
+    neutralize_relocations(data, pe, PATCH_SITE_VA, len(expected), label)
+
+    cave = bytearray()
+    def emit(b): cave.extend(b)
+
+    emit(bytes([0x83, 0x7D, 0x10, 0x64]))        # CMP dword ptr [EBP+0x10],0x64
+    jge_pos = len(cave)
+    emit(bytes([0x0F, 0x8D, 0, 0, 0, 0]))        # JGE SKIP_VA
+    emit(expected)                                # replay the two overwritten instructions
+    jmp_resume_pos = len(cave)
+    emit(bytes([0xE9, 0, 0, 0, 0]))              # JMP RESUME_VA
+
+    cave_va = ptch_va + cave_cursor
+    struct.pack_into("<i", cave, jge_pos + 2, SKIP_VA - (cave_va + jge_pos + 6))
+    struct.pack_into("<i", cave, jmp_resume_pos + 1, RESUME_VA - (cave_va + jmp_resume_pos + 5))
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    cave_cursor += len(cave)
+
+    redirect = bytearray([0xE9, 0, 0, 0, 0])
+    struct.pack_into("<i", redirect, 1, cave_va - (PATCH_SITE_VA + 5))
+    redirect += b"\x90" * (len(expected) - len(redirect))
+    data[off:off + len(expected)] = redirect
 
     print(f"  [OK] {label}")
     FIXES_APPLIED.append(label)
@@ -2412,6 +2704,9 @@ def main():
     cave_cursor = fix_del_command(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_allstop_docked_writeguard(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_readshipmodule_unresolvable_identifier(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_trade_pod_error_args(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_quit_networked_disconnect(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_addon_move_oob(data, pe, ptch_va, ptch_off, cave_cursor)
     pe.close()
 
     if cave_cursor > ptch_size:
