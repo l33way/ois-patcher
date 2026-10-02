@@ -23,7 +23,8 @@ Under the following terms:
 
 No warranties are given. This license covers only the original
 material in this repository -- the patcher script (ois_patcher.py),
-the data-fix generator (apply_data_fixes.py), this mod's own metadata
+the data-fix generator (apply_data_fixes.py) and its correction table
+(text_fixes.py), this mod's own metadata
 (modinfo.txt), and the documentation. It does not cover, and makes no
 claim over, "Objects in Space" itself or any of Flat Earth Games' own
 asset files -- including the files apply_data_fixes.py reconstructs at

@@ -51,7 +51,7 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           staging="oisbugfix-patcher-${version}"
           mkdir "$staging"
-          cp README.md LICENSE ois_patcher.py apply_data_fixes.py "$staging"/
+          cp README.md LICENSE ois_patcher.py apply_data_fixes.py text_fixes.py "$staging"/
           cp -r mod "$staging"/
           zip -r "${staging}.zip" "$staging"
           echo "zip_name=${staging}.zip" >> "$GITHUB_OUTPUT"
