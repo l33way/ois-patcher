@@ -125,11 +125,57 @@ import subprocess
 import sys
 from pathlib import Path
 
+def _pause_before_exit():
+    """Keep the console window open when launched on Windows (e.g. via
+    double-click in File Explorer), unless running unattended (--yes/-y)
+    or inside the child process of a self-update restart."""
+    if os.environ.get("OIS_PATCHER_NO_PAUSE"):
+        return
+    if any(a in ("--yes", "-y") for a in sys.argv[1:]):
+        return
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            print("\nPress any key to close this window...", end="", flush=True)
+            msvcrt.getch()
+            print()
+        else:
+            input("\nPress Enter to close...")
+    except Exception:
+        pass
+
+
 try:
     import pefile
 except ImportError:
-    print("This script needs 'pefile': pip install pefile", file=sys.stderr)
-    sys.exit(1)
+    print("This script needs the 'pefile' package to parse game executables.", file=sys.stderr)
+    
+    try:
+        ans = input("Would you like to install 'pefile' now using pip? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    if ans in ("y", "yes"):
+        print("Installing pefile...", flush=True)
+        res = subprocess.run([sys.executable, "-m", "pip", "install", "pefile"], capture_output=True, text=True)
+        if res.returncode == 0:
+            print("Successfully installed 'pefile'! Continuing...")
+            try:
+                import pefile
+            except ImportError:
+                print("[ERROR] pefile was installed but could not be loaded. Please restart the script.", file=sys.stderr)
+                _pause_before_exit()
+                sys.exit(1)
+        else:
+            print(f"Failed to install pefile automatically:\n{res.stderr.strip()}\n", file=sys.stderr)
+            print("Please open a terminal and run manually:\n  py -m pip install pefile", file=sys.stderr)
+            _pause_before_exit()
+            sys.exit(1)
+    else:
+        print("Cannot continue without pefile. Exiting.", file=sys.stderr)
+        _pause_before_exit()
+        sys.exit(1)
 
 # The docstring promises the mod install degrades to a warning if this is
 # missing, so a hard ImportError here would break that promise on the very
@@ -151,7 +197,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.4.0"
+PATCHER_VERSION = "0.4.1"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 32  # reserved bytes at the start of .ptch's raw data
 
@@ -2489,6 +2535,177 @@ def fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=F
 
 
 # ============================================================
+# Fix 33: some NPC ships turn up with their IFF off ("Unknown" in red on the nav map) and
+# "Turning my reactors off" in the debug log, on some machines and not on others -- Leslie
+# Garbut's SS Jolly Rancher in the intro, for one.  ShipBehaviour (0x164 bytes, allocated
+# with operator_new, which does not clear memory) has a "stealthy" byte at +0x160 that is
+# set to 1 when a ship is a pirate or has `stealthy=true`, but is never set to 0
+# otherwise: the constructor initialises everything up to +0x158 and stops.  Its reader
+# (ShipBehaviour::general_runLogic) treats any non-zero value as "run dark": IFF off and
+# the reactors switched off.  So every other general-mode ship runs dark if the leftover heap
+# memory happens to be non-zero, which depends on what the heap held before.  A debug log
+# taken with an IFF diagnostic showed two scripted ships (Spioenkop and the Jolly Rancher)
+# switching IFF 1 -> 0 inside the AI update the moment their first desire started.
+# Fix: the constructor's last store (`mov [edi+0x158],0`) also zeroes +0x15c and +0x160, the
+# rest of the object.  Client and server.
+# ============================================================
+
+def fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "NPC ships run dark (IFF off) from uninitialised memory" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    SITE = 0x00502144 if server else 0x00502864          # last store of ShipBehaviour::ShipBehaviour
+    if verify_site(data, pe, SITE - 10, bytes.fromhex("C7875401000000000000" "C7875801000000000000" "8B4F3C8B476C"),
+                   label) is None:
+        return bail(label, cave_cursor, server)
+    neutralize_relocations(data, pe, SITE, 10, label)
+    cave_va = ptch_va + cave_cursor
+    c = bytearray(bytes.fromhex("C7875801000000000000"))        # MOV DWORD [EDI+0x158],0   (the original store)
+    c += bytes.fromhex("C7875C01000000000000")                  # MOV DWORD [EDI+0x15C],0
+    c += bytes.fromhex("C7876001000000000000")                  # MOV DWORD [EDI+0x160],0   the stealthy flag
+    c += b"\xE9" + _rel32(cave_va, len(c), SITE + 10, 1)
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c)] = c
+    cave_cursor += len(c)
+    off = va_to_offset(pe, SITE)
+    data[off:off + 10] = b"\xE9" + struct.pack("<i", cave_va - (SITE + 5)) + b"\x90" * 5
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor
+
+
+# ============================================================
+
+# ============================================================
+# Fix 33: Crash to desktop when returning from a station to the player
+# ship on saves played for some time (GitHub issue #58).
+#
+# Cocos2d-x's RenderTexture::begin / Node::visit / RenderTexture::end
+# (called inside ScreenInterface::update) is deferred: it pushes
+# QuadCommands holding raw pointers to each TextField's TextureAtlas
+# quads into cocos2d::Renderer's command queue, to be drawn later when
+# Director::drawScene runs at the end of the frame.
+#
+# Two places in ois.exe queued a ScreenInterface::update pass and then
+# destroyed that same ScreenInterface (and its TextFields) later in the
+# SAME frame before Director::drawScene flushed the queue:
+#   1. PresentationInterface::update called Room::runLogic (which calls
+#      ScreenInterface::update on all monitors in the current room, such
+#      as the station airlock's news/info screens) BEFORE calling
+#      runFullFadeLogic. On the frame the 0.3s fade-out timer expired for
+#      leaveDockedVessel / boardDockedVessel / boardMooredStructure,
+#      runFullFadeLogic called showRoom -> cleanupCurrentRoom, freeing
+#      the outgoing room's ScreenInterfaces while their RenderTexture
+#      QuadCommands from Room::runLogic were still queued for drawScene.
+#   2. Inside Room::runLogic's per-object loop, ScreenInterface::update
+#      ran at the top of the loop body BEFORE the three state/visibility
+#      checks (+0x514, +0x5c4, +0x4a4) that call RoomObject::render ->
+#      cleanupObject, which deletes and recreates the object's
+#      ScreenInterfaces whenever its state or visibility changes.
+#
+# Fix:
+#   (a) Run runFullFadeLogic before Room::runLogic in
+#       PresentationInterface::update, and skip Room::runLogic while
+#       fading out (m_fadeState == 1) or on the frame a fade transition
+#       swaps rooms (showRoom -> Room::render already updates the new
+#       room's screens).
+#   (b) In Room::runLogic, run ScreenInterface::update after the three
+#       RoomObject::render state/visibility checks instead of before them.
+# ============================================================
+
+def fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Crash returning from a station to the player ship (RenderTexture use-after-free)"
+
+    # --- Site A: PresentationInterface::update before Room::runLogic ---
+    UPD_SITE_VA = 0x0052ef66
+    UPD_RESUME_VA = 0x0052ef6c
+    UPD_SKIP_ROOM_VA = 0x0052ef7a
+    FADE_CALL_SITE_VA = 0x0052f193
+    RUN_FADE_LOGIC_VA = 0x0052e1f0
+
+    # --- Site B: Room::runLogic ScreenInterface::update ordering ---
+    RL_EARLY_JNE_VA = 0x00536bba
+    RL_LATE_SITE_VA = 0x00536e5e
+    RL_LATE_RESUME_VA = 0x00536e6a
+    SCREEN_UPDATE_VA = 0x00557320
+
+    exp_upd = bytes.fromhex("8B8ED4020000")                 # MOV ECX,[ESI+0x2d4]
+    exp_fade = bytes.fromhex("E858F0FFFF")                  # CALL 0x0052e1f0 (runFullFadeLogic)
+    exp_rl_early = bytes.fromhex("83793C04" "751D")         # CMP dword [ECX+0x3c],4 ; JNE 0x536bdd
+    exp_rl_late = bytes.fromhex("8B8690000000" "0F57C9" "8B3C07")  # MOV EAX,[ESI+0x90] ; XORPS XMM1,XMM1 ; MOV EDI,[EDI+EAX]
+
+    off_upd = verify_site(data, pe, UPD_SITE_VA, exp_upd, label + " (update room logic)")
+    off_fade = verify_site(data, pe, FADE_CALL_SITE_VA, exp_fade, label + " (late runFullFadeLogic call)")
+    off_rl_early = verify_site(data, pe, RL_EARLY_JNE_VA, exp_rl_early, label + " (runLogic early screen update)")
+    off_rl_late = verify_site(data, pe, RL_LATE_SITE_VA, exp_rl_late, label + " (runLogic post-render site)")
+    if None in (off_upd, off_fade, off_rl_early, off_rl_late):
+        return bail(label, cave_cursor)
+
+    for site, length in ((UPD_SITE_VA, 6), (FADE_CALL_SITE_VA, 5), (RL_EARLY_JNE_VA, 6), (RL_LATE_SITE_VA, 12)):
+        neutralize_relocations(data, pe, site, length, label)
+
+    # Cave 1: at 0x0052ef66, run runFullFadeLogic(dt) first. If a fade-out is
+    # active ([ESI+0x29c] == 1) or a transition action ([ESI+0x2a4]) just fired
+    # on this tick, skip Room::runLogic so no outgoing room queues RenderTexture
+    # commands before cleanupCurrentRoom and no newly-shown room is updated twice.
+    cave1_va = ptch_va + cave_cursor
+    c1 = bytearray()
+    c1 += bytes.fromhex("FF B6 A4 02 00 00")                # PUSH dword [ESI+0x2a4] (pre-call fade action)
+    c1 += bytes.fromhex("F3 0F 10 4D 08")                   # MOVSS XMM1,[EBP+0x8]   (dt)
+    c1 += bytes.fromhex("8B CE")                            # MOV ECX,ESI
+    c1 += b"\xE8" + _rel32(cave1_va, len(c1), RUN_FADE_LOGIC_VA, 1)  # CALL runFullFadeLogic
+    c1 += bytes.fromhex("58")                               # POP EAX                (old fade action)
+    c1 += bytes.fromhex("83 BE 9C 02 00 00 01")             # CMP dword [ESI+0x29c],1 (fading out to black?)
+    c1 += b"\x0F\x84" + _rel32(cave1_va, len(c1), UPD_SKIP_ROOM_VA, 2)  # JE skip_room_logic
+    c1 += bytes.fromhex("85 C0")                            # TEST EAX,EAX           (was a transition pending?)
+    jz_normal = len(c1) + 1
+    c1 += b"\x74\x00"                                       # JZ normal
+    c1 += bytes.fromhex("83 BE A4 02 00 00 00")             # CMP dword [ESI+0x2a4],0 (did it just fire?)
+    c1 += b"\x0F\x84" + _rel32(cave1_va, len(c1), UPD_SKIP_ROOM_VA, 2)  # JE skip_room_logic
+    c1[jz_normal] = len(c1) - (jz_normal + 1)
+    c1 += exp_upd                                           # MOV ECX,[ESI+0x2d4]
+    c1 += b"\xE9" + _rel32(cave1_va, len(c1), UPD_RESUME_VA, 1)
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c1)] = c1
+    cave_cursor += len(c1)
+
+    # Cave 2: at 0x00536e5e in Room::runLogic, after any RoomObject::render
+    # rebuilds for this object have completed, run ScreenInterface::update if
+    # this object is a screen ([EDI+0x3c] == 4).
+    cave2_va = ptch_va + cave_cursor
+    c2 = bytearray()
+    c2 += bytes.fromhex("8B 86 90 00 00 00")                # MOV EAX,[ESI+0x90]
+    c2 += bytes.fromhex("8B 3C 07")                         # MOV EDI,[EDI+EAX]      (RoomObject*)
+    c2 += bytes.fromhex("83 7F 3C 04")                      # CMP dword [EDI+0x3c],4
+    jne_skip = len(c2) + 1
+    c2 += b"\x75\x00"                                       # JNE done
+    c2 += bytes.fromhex("8B 87 88 03 00 00")                # MOV EAX,[EDI+0x388]
+    c2 += bytes.fromhex("8B 8C 87 24 06 00 00")             # MOV ECX,[EDI+EAX*4+0x624] (ScreenInterface*)
+    c2 += bytes.fromhex("85 C9")                            # TEST ECX,ECX
+    je_skip = len(c2) + 1
+    c2 += b"\x74\x00"                                       # JE done
+    c2 += bytes.fromhex("F3 0F 10 4D EC")                   # MOVSS XMM1,[EBP-0x14]  (dt)
+    c2 += bytes.fromhex("51")                               # PUSH ECX               (bool param_2)
+    c2 += b"\xE8" + _rel32(cave2_va, len(c2), SCREEN_UPDATE_VA, 1)  # CALL ScreenInterface::update
+    c2[jne_skip] = len(c2) - (jne_skip + 1)
+    c2[je_skip] = len(c2) - (je_skip + 1)
+    c2 += bytes.fromhex("0F 57 C9")                         # XORPS XMM1,XMM1
+    c2 += b"\xE9" + _rel32(cave2_va, len(c2), RL_LATE_RESUME_VA, 1)
+
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c2)] = c2
+    cave_cursor += len(c2)
+
+    # Patch Site 1A (0x0052ef66): JMP cave1 + NOP
+    data[off_upd:off_upd + 6] = b"\xE9" + struct.pack("<i", cave1_va - (UPD_SITE_VA + 5)) + b"\x90"
+    # Patch Site 1B (0x0052f193): NOP out the old late CALL runFullFadeLogic
+    data[off_fade:off_fade + 5] = b"\x90" * 5
+    # Patch Site 2A (0x00536bbe): change JNE (75 1D) to JMP (EB 1D) to skip early ScreenInterface::update
+    data[off_rl_early + 4] = 0xEB
+    # Patch Site 2B (0x00536e5e): JMP cave2 + 7 NOPs
+    data[off_rl_late:off_rl_late + 12] = b"\xE9" + struct.pack("<i", cave2_va - (RL_LATE_SITE_VA + 5)) + b"\x90" * 7
+
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
 
 def fix_pirate_hunt_server(data, pe, ptch_va, ptch_off, cave_cursor):
     label = "Pirate Hunt crash guard (server)"
@@ -2619,6 +2836,7 @@ def patch_server_exe(exe_path):
     cave_cursor = fix_pds_torpedoes(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     pe.close()
 
     if cave_cursor > ptch_size:
@@ -3444,7 +3662,7 @@ def prepare_for_patch(client_exe, force=False, assume_yes=False):
 #      does NOT imply consent here; --update does.
 # ============================================================
 
-REPO_URL = ""  # e.g. "https://github.com/you/ois-patcher" -- shown when git isn't usable
+REPO_URL = "https://github.com/l33way/ois-patcher"  # fallback when git origin remote can't be read
 UPDATED_ENV = "OIS_PATCHER_SELF_UPDATED"  # re-exec guard: one update per invocation
 
 
@@ -3458,15 +3676,32 @@ def _git(args, cwd, timeout=30):
         return None
 
 
-def _manual_update_hint(reason):
+def _detect_repo_url(cwd):
+    """Detects the GitHub repo URL from git's origin remote so forks
+    (e.g. Voidless7125/ois-patcher) automatically use their own URL,
+    falling back to REPO_URL when not in a git checkout."""
+    res = _git(["remote", "get-url", "origin"], cwd)
+    if res is not None and res.returncode == 0:
+        raw = res.stdout.strip()
+        if raw.startswith("git@github.com:"):
+            raw = "https://github.com/" + raw[len("git@github.com:"):]
+        if raw.endswith(".git"):
+            raw = raw[:-4]
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw
+    return REPO_URL
+
+
+def _manual_update_hint(reason, repo_dir=None):
     """Silent when REPO_URL is unset: most people run this from a
     downloaded zip, and telling them every single run that updates can't
     be checked -- without being able to say where to look -- is noise,
     not help."""
-    if not REPO_URL:
+    url = _detect_repo_url(repo_dir) if repo_dir else REPO_URL
+    if not url:
         return
     print(f"\n[NOTICE] Can't check for updates automatically ({reason}).")
-    print(f"         Check for a newer release at: {REPO_URL}")
+    print(f"         Check for a newer release at: {url}")
 
 
 def check_for_updates(assume_update=False):
@@ -3500,7 +3735,7 @@ def check_for_updates(assume_update=False):
 
     upstream = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], repo)
     if upstream is None or upstream.returncode != 0:
-        _manual_update_hint("this branch has no upstream to compare against")
+        _manual_update_hint("this branch has no upstream to compare against", repo)
         return False
 
     print("Checking for patcher updates...")
@@ -3549,6 +3784,7 @@ def check_for_updates(assume_update=False):
     print("Updated. Re-running the patcher with the new version...\n")
     env = dict(os.environ)
     env[UPDATED_ENV] = "1"
+    env["OIS_PATCHER_NO_PAUSE"] = "1"
     # A fresh process, not os.execv: this keeps console behaviour sane on
     # Windows and guarantees the new apply_data_fixes.py is the one imported.
     result = subprocess.run([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
@@ -3729,7 +3965,9 @@ def main():
     cave_cursor = fix_pds_panel_name_overflow(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
     pe.close()
 
     if cave_cursor > ptch_size:
@@ -3763,4 +4001,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(130)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        _pause_before_exit()

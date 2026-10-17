@@ -28,6 +28,20 @@ from pathlib import Path
 FIXES = {
     # BUG-001: a literal typo in an include directive orphaned an entire
     # co-op scenario.
+        # Cassandra docking permission typo fix
+    "ui_cassandra.txt": [
+        (1,
+         "    text=7,21,180,134,`7Permission is required undock your utility shuttle from the Cassandra.,NONE,!OWES_MONEY_TO_DOCKED_STATION",
+         "    text=7,21,180,134,`7Permission is required to undock your utility shuttle from the Cassandra.,NONE,!OWES_MONEY_TO_DOCKED_STATION"),
+    ],
+
+        # Lester F Ward transit bug fix (Game breaking loop)
+    "lfw_lesterfward3.txt": [
+        (1,
+         "req=!lfw_lesterfwradconv3done",
+         "req=!lfw_lesterfwardconv3done"),
+    ],
+
     "scenarios.txt": [
         (1,
          "include coop_escort_3.txtX",

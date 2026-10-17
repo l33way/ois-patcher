@@ -1076,4 +1076,7 @@ TEXT_FIXES = {
     'yrs_florianogarcia.txt': [
         (1, 'Sol was an unweildy number. Some', 'Sol was an unwieldy number. Some'),
     ],
+    'owi_lesliegarbut3.txt': [
+        (1, 'text=Me I work for', 'text=I work for'),
+    ],
 }

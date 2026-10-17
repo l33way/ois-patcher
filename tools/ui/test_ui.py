@@ -149,7 +149,51 @@ def main():
               and emu.uc.reg_read(UC_X86_REG_ESP) == frame)
     print("all UI checks pass" if not bad else f"{bad} FAILED")
     sys.exit(1 if bad else 0)
+# station-to-ship crash fix:
+    # (1) PresentationInterface::update runs runFullFadeLogic before Room::runLogic, and skips
+    #     Room::runLogic while fading out ([esi+0x29c]==1) or when a transition ([esi+0x2a4]) fires
+    UPD_SITE, UPD_SKIP, FADE_FN, RL_FN = 0x52EF66, 0x52EF7A, 0x52E1F0, 0x536B60
+    events = []
 
+    def fade_and_rl_stub(uc, address, size, user):
+        esp = uc.reg_read(UC_X86_REG_ESP)
+        if address == FADE_FN:
+            events.append("fade")
+            this_ptr = uc.reg_read(UC_X86_REG_ECX)
+            if fade_and_rl_stub.consume_action:
+                emu.w32(this_ptr + 0x2A4, 0)  # simulate leaveDockedVessel firing & clearing +0x2a4
+            uc.reg_write(UC_X86_REG_EIP, emu.r32(esp))
+            uc.reg_write(UC_X86_REG_ESP, esp + 4)
+        elif address == RL_FN:
+            events.append("runLogic")
+            uc.reg_write(UC_X86_REG_EIP, emu.r32(esp))
+            uc.reg_write(UC_X86_REG_ESP, esp + 4)
+
+    emu.uc.hook_add(UC_HOOK_CODE, fade_and_rl_stub, begin=FADE_FN, end=RL_FN)
+    from unicorn.x86_const import UC_X86_REG_ESI, UC_X86_REG_EBP
+    pi = emu.alloc(0x420)
+    room = emu.alloc(0x100)
+    emu.w32(pi + 0x2D4, room)
+
+    for name, fade_state, action, consume, want in (
+        ("normal tick (no fade): fade then runLogic", 0, 0, False, ["fade", "runLogic"]),
+        ("fading out (state=1): fade only, runLogic skipped", 1, 3, False, ["fade"]),
+        ("transition fired (action 3->0): fade only, runLogic skipped", 2, 3, True, ["fade"]),
+    ):
+        events.clear()
+        fade_and_rl_stub.consume_action = consume
+        emu.w32(pi + 0x29C, fade_state)
+        emu.w32(pi + 0x2A4, action)
+        emu.stops.clear()
+        emu.stops[UPD_SKIP] = "done"
+        emu.stopped_at = None
+        frame = tp.STACK_TOP - 0x6000
+        emu.wf(frame + 8, 0.016)
+        emu.uc.reg_write(UC_X86_REG_EBP, frame)
+        emu.uc.reg_write(UC_X86_REG_ESP, frame - 0x40)
+        emu.uc.reg_write(UC_X86_REG_ESI, pi)
+        emu.uc.emu_start(UPD_SITE, 0, count=200)
+        check(name, emu.stopped_at == "done" and events == want and emu.uc.reg_read(UC_X86_REG_ESP) == frame - 0x40)
 
 if __name__ == "__main__":
     main()
