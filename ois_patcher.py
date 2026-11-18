@@ -2382,6 +2382,50 @@ def fix_news_enter_without_selection(data, pe, ptch_va, ptch_off, cave_cursor):
 
 
 # ============================================================
+# Fix 35: the mechanic / shop's "Hit Chce" figure for a point-defence laser is wrong.
+# Screen_UpgradeTerminal prints ((sides + 1) / 2) * count + constant, times 100, minus 100 -- the *average roll*
+# of the module's `hitchance=` dice as a percentage -- so 1d6 and 1d5 show "200%" and 1d4 and 1d3 show "100%"
+# (the weakest lasers look best).  The PDS actually hits when its dice come up 1 (ShipModule::runLogic:
+# `if (diceRoll(hitchance) == 1)`), i.e. one in N for a 1dN die: 16.7% for a PDL 101, 33% for an SDS 55L.  The
+# figure is now that chance, rounded to a whole percent; a dice expression that can never roll 1 (more than one
+# die, or a constant added) shows 0%.  In place, no cave: the 52-byte calculation ends with the percentage in EAX
+# (`cvttss2si eax,xmm1`) just before `push eax`, and the replacement is 48 bytes padded with NOPs.
+# ============================================================
+
+HITCHANCE_ORIGINAL = bytes.fromhex(
+    "8b81ec00000040992bc2d1f80faf81e80000000381f0000000660f6ec80f5bc9f30f590d64176300f30f5c0d64176300f30f2cc1")
+HITCHANCE_NEW = bytes.fromhex(
+    "8b81ec000000"              # MOV EAX,[ECX+0xEC]        sides
+    "83b9e800000001" "751f"     # CMP [ECX+0xE8],1          one die?                 JNE zero
+    "83b9f000000000" "7516"     # CMP [ECX+0xF0],0          nothing added?           JNE zero
+    "85c0" "7e12"               # TEST EAX,EAX              sides > 0?               JLE zero
+    "b8c8000000"                # MOV EAX,200
+    "31d2"                      # XOR EDX,EDX
+    "f7b1ec000000"              # DIV DWORD [ECX+0xEC]      200 / sides
+    "40" "d1e8"                 # INC EAX ; SHR EAX,1       (200/sides + 1) / 2 = 100/sides, rounded
+    "eb02"                      # JMP done
+    "31c0"                      # zero: XOR EAX,EAX
+)
+
+
+def fix_pds_hit_chance_label(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = 'Shop: point-defence "Hit Chce" shows the average roll (200%/100%) instead of the real 1-in-N chance'
+    SITE = 0x005511E6
+    if verify_site(data, pe, SITE, HITCHANCE_ORIGINAL, label) is None \
+            or verify_site(data, pe, SITE + len(HITCHANCE_ORIGINAL), bytes.fromhex("5068"), label + " (push eax)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    body = HITCHANCE_NEW + b"\x90" * (len(HITCHANCE_ORIGINAL) - len(HITCHANCE_NEW))
+    assert len(body) == len(HITCHANCE_ORIGINAL)
+    neutralize_relocations(data, pe, SITE, len(body), label)
+    off = va_to_offset(pe, SITE)
+    data[off:off + len(body)] = body
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
 # Fix 29: point-defence panel: a long manufacturer + name wraps onto a second line and
 # pushes everything below it into the ENABLE/DISABLE button.  ShipTextData formats
 # the first line of the PDS info as "`!%s `%%%s\n" (manufacturer, name) and the
@@ -4097,6 +4141,7 @@ def main():
     cave_cursor = fix_forced_conversation_first_option(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_news_enter_without_selection(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_pds_panel_name_overflow(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_pds_hit_chance_label(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
