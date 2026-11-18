@@ -297,6 +297,20 @@ def _fix_lists(server):
     return (SERVER_FIXES_APPLIED, SERVER_FIXES_SKIPPED) if server else (FIXES_APPLIED, FIXES_SKIPPED)
 
 
+def _plugin_call(name, *args, default=None, **kwargs):
+    """Calls personal_variants.<name>(...) when that optional plugin file exists and defines <name>;
+    otherwise returns `default`. Only a missing personal_variants.py is tolerated: an ImportError
+    raised from inside the plugin is a bug in it and is reported, not swallowed."""
+    try:
+        import personal_variants
+    except ModuleNotFoundError as e:
+        if e.name != "personal_variants":
+            raise
+        return default
+    fn = getattr(personal_variants, name, None)
+    return default if fn is None else fn(*args, **kwargs)
+
+
 def bail(label, cave_cursor, server=False):
     """Records `label` as skipped and returns the unchanged cave cursor."""
     _fix_lists(server)[1].append(label)
@@ -2704,6 +2718,66 @@ def fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor):
     return cave_cursor
 
 
+# ============================================================
+# Fix 34: Options > resolution takes several clicks per visible change (Issue #61).
+# OISConfiguration::configure() builds `validResolutions` by looping over
+# EnumDisplaySettingsW(NULL, i, &devmode) and appending every mode's
+# (dmPelsWidth, dmPelsHeight).  Windows returns one mode per refresh rate (and
+# per colour depth), so 1920x1080 at 60/75/100/120/144 Hz is five identical list
+# entries, and every click on the resolution selector only moves one entry along.
+# Fix: before appending a mode, scan the entries added so far and skip it if the
+# same width x height is already in the list (the first occurrence is kept).  The
+# saved setting is a "WxH" string that load() looks up in the list, so existing
+# config files keep working.  Client only (the server has no display list).
+# ============================================================
+
+def fix_resolution_list_duplicates(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Resolution setting: one click per distinct resolution (duplicate refresh-rate modes removed)"
+    SITE, SKIP_APPEND, GO_APPEND = 0x004B0B47, 0x004B0B6A, 0x004B0B4D
+    LIST_VA = 0x0065D760                                   # validResolutions: _Myfirst, _Mylast (+4), _Myend (+8)
+    # CMP [_Myend],EAX / JE realloc  ...  LEA EAX,[EBP-0xE0] (the loop's next EnumDisplaySettingsW call)
+    if verify_site(data, pe, SITE, bytes.fromhex("3905" "68D76500" "740E"), label) is None \
+            or verify_site(data, pe, SKIP_APPEND, bytes.fromhex("8D8520FFFFFF"), label + " (loop continue)") is None \
+            or verify_site(data, pe, SITE - 0x12, bytes.fromhex("8B4DCC8B55D0"), label + " (width/height loads)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    neutralize_relocations(data, pe, SITE, 6, label)
+    cave_va = ptch_va + cave_cursor
+    c = bytearray()
+    # On entry (from inside the loop): EAX = _Mylast, ECX = width, EDX = height, ESI = mode index, EDI = EnumDisplaySettingsW
+    c += bytes.fromhex("53")                                       # PUSH EBX
+    c += bytes.fromhex("E800000000" "5B")                          # CALL $+5 ; POP EBX  (position independent)
+    pop_va = cave_va + len(c) - 1                                  # address of the POP, which is what EBX now holds
+    c += bytes.fromhex("81C3") + struct.pack("<i", LIST_VA - pop_va)   # ADD EBX,<delta>  -> EBX = &validResolutions
+    c += bytes.fromhex("56")                                       # PUSH ESI (it is the loop's mode index)
+    c += bytes.fromhex("8B33")                                     # MOV ESI,[EBX]      first entry
+    scan = len(c)
+    c += bytes.fromhex("3BF0")                                     # scan: CMP ESI,EAX  (reached _Mylast?)
+    jae = len(c) + 1; c += b"\x73\x00"                             # JAE not_found
+    c += bytes.fromhex("390E")                                     # CMP [ESI],ECX      same width?
+    jne = len(c) + 1; c += b"\x75\x00"                             # JNE next
+    c += bytes.fromhex("395604")                                   # CMP [ESI+4],EDX    same height?
+    je = len(c) + 1; c += b"\x74\x00"                              # JE found
+    c[jne] = len(c) - (jne + 1)
+    c += bytes.fromhex("83C608")                                   # next: ADD ESI,8
+    c += b"\xEB" + bytes([(scan - (len(c) + 2)) & 0xFF])           # JMP scan
+    c[jae] = len(c) - (jae + 1)
+    c += bytes.fromhex("5E")                                       # not_found: POP ESI
+    c += bytes.fromhex("394308")                                   # CMP [EBX+8],EAX   (the displaced "CMP [_Myend],EAX")
+    c += bytes.fromhex("5B")                                       # POP EBX           (POP keeps the flags for the JE)
+    c += b"\xE9" + _rel32(cave_va, len(c), GO_APPEND, 1)           # JMP back to the original JE realloc
+    c[je] = len(c) - (je + 1)
+    c += bytes.fromhex("5E" "5B")                                  # found: POP ESI / POP EBX
+    c += b"\xE9" + _rel32(cave_va, len(c), SKIP_APPEND, 1)         # JMP past the append: duplicate, not added
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c)] = c
+    cave_cursor += len(c)
+    off = va_to_offset(pe, SITE)
+    data[off:off + 6] = b"\xE9" + struct.pack("<i", cave_va - (SITE + 5)) + b"\x90"
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
 def fix_pirate_hunt_server(data, pe, ptch_va, ptch_off, cave_cursor):
     label = "Pirate Hunt crash guard (server)"
     PATCH_SITE_VA, RESUME_VA, LOOP_EXIT_VA = 0x00408947, 0x0040894d, 0x004089d3
@@ -2835,12 +2909,9 @@ def patch_server_exe(exe_path):
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
 
-    # --- PLUGIN HOOK ---
-    try:
-        import personal_variants
-        cave_cursor = personal_variants.apply_exe_fixes(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
-    except ImportError:
-        pass
+    # --- PLUGIN HOOK (the user already chose variants in begin_run) ---
+    cave_cursor = _plugin_call("apply_exe_fixes", data, pe, ptch_va, ptch_off, cave_cursor,
+                               server=True, default=cave_cursor)
     # -------------------
     pe.close()
 
@@ -3448,6 +3519,8 @@ def print_status(game_dir):
     print(f"  {'bugfix mod':<16} {'installed at ' + str(mod_dir) if mod_dir.is_dir() else 'not installed'}")
     n = len(saved_originals(game_dir))
     print(f"  {'news/info text':<16} {f'{n} article(s) corrected in place; originals in {ORIGINALS_DIRNAME}/' if n else 'not modified'}")
+    for line in _plugin_call("status_lines", game_dir, default=[]) or []:
+        print(line)
 
 
 def confirm(question, assume_yes):
@@ -3496,7 +3569,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
     print(f"  {'news/info text':<16} "
           f"{str(len(news_saved)) + ' corrected article(s), originals saved' if news_saved else 'not modified'}")
 
-    if not restorable and not mod_present and not news_saved:
+    plugin_items = _plugin_call("uninstall_plan", game_dir, default=[]) or []
+    if not restorable and not mod_present and not news_saved and not plugin_items:
         print("\nNothing installed by this script was found -- nothing to undo.")
         return True
 
@@ -3509,6 +3583,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
     if news_saved:
         print(f"  - restore {len(news_saved)} news/info article(s) in assets/ from {ORIGINALS_DIRNAME}/"
               f"{'' if keep_backups else ', then delete that folder'}")
+    for item in plugin_items:
+        print(f"  - {item}")
     print("  - leave save games, settings and every other game file untouched")
 
     if not confirm("\nProceed?", assume_yes):
@@ -3526,6 +3602,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
         remove_mod(game_dir)
     if news_saved:
         ok = restore_news_info(game_dir, keep_backup=keep_backups) and ok
+    if plugin_items:
+        ok = bool(_plugin_call("uninstall", game_dir, keep_backups, default=True)) and ok
 
     print("\n" + "=" * 60)
     if ok:
@@ -3933,16 +4011,24 @@ def main():
         sys.exit(1)
 
     if action == "mod-only":
+        # exes are current: variants that live in the exe can't change now, the others can still be chosen
+        _plugin_call("begin_run", game_dir, args.yes, exe_patching=False)
         print("\nRefreshing data-only bugfix mod...")
         mod_installed = install_mod(exe_path)
         print(f"\nBugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
+        _plugin_call("post_install", game_dir)
+        for line in _plugin_call("summary_lines", default=[]) or []:
+            print(line)
         print("Exe fixes: already up to date, nothing changed.")
         sys.exit(0)
 
-    print(f"\nPatching: {exe_path}")
-
     if not ensure_writable([exe_path, game_dir / "ois_server.exe"]):
         sys.exit(1)
+
+    # Optional personal variants (personal_variants.py): asked one at a time, before anything is patched.
+    _plugin_call("begin_run", game_dir, args.yes)
+
+    print(f"\nPatching: {exe_path}")
 
     # Read and validate first. Writing a backup of a file that turns out
     # not to be patchable leaves confusing litter in the game folder and
@@ -4016,13 +4102,11 @@ def main():
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_resolution_list_duplicates(data, pe, ptch_va, ptch_off, cave_cursor)
 
     # --- PLUGIN HOOK ---
-    try:
-        import personal_variants
-        cave_cursor = personal_variants.apply_exe_fixes(data, pe, ptch_va, ptch_off, cave_cursor, server=False)
-    except ImportError:
-        pass
+    cave_cursor = _plugin_call("apply_exe_fixes", data, pe, ptch_va, ptch_off, cave_cursor,
+                               server=False, default=cave_cursor)
     # -------------------
     pe.close()
 
@@ -4038,6 +4122,8 @@ def main():
     print("\nInstalling data-only bugfix mod...")
     mod_installed = install_mod(exe_path)
 
+    _plugin_call("post_install", game_dir)
+
     print(f"\n{'='*60}")
     print(f"Applied {len(FIXES_APPLIED)} exe fix(es), skipped {len(FIXES_SKIPPED)}.")
     if FIXES_SKIPPED:
@@ -4049,6 +4135,8 @@ def main():
     else:
         print("ois_server.exe: not patched, see above (only matters for hosting/joining co-op games).")
     print(f"Bugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
+    for line in _plugin_call("summary_lines", default=[]) or []:
+        print(line)
     print(f"\nPatched: {exe_path}")
     print(f"Original backed up at: {backup_path}")
     print("To undo everything (exe(s) restored, mod removed):")
