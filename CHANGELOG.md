@@ -14,6 +14,7 @@ All notable changes to the **Objects in Space — Unofficial Bugfix Patch** are 
 
 ### [0.4.1] - 2026-10-15
 
+- **Regression fix (mod):** The Remora RCS (`AP-RCS1`, `modules_npc.txt`) was buyable in shops again: the `basevalue=0` entry listed under 0.4.0 had been removed by a later clean-up while the changelog still claimed it. Restored ([Issue #50](https://github.com/l33way/ois-patcher/issues/50)). The shop only stocks module classes with a `basevalue` of at least 1 (`TradeLocation::addRandomModules`), so 0 keeps it on the Remora but out of the shops.
 - **Plugin Architecture**: Added dynamic loading of `personal_variants.py` (if present) to allow custom executable and data patches without modifying the core files or maintaining hard forks.
 - **Branch Warning System**: The patcher now detects if you are on a non-standard or personal fork/branch and displays a warning to prevent accidental updates from mismatched upstreams.
 - **Extended Cave Size**: Increased the `.ptch` section allocation to `0x1000` to comfortably accommodate larger community mods.

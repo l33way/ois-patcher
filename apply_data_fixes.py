@@ -313,6 +313,15 @@ FIXES = {
         (1, "\tid=mkxladarat", "\tid=mkxladrt"),
     ],
 
+    # Issue #50: the Remora-only modules (remorareact, remorasensor) live in modules_npc.txt.  The shop stock
+    # generator (TradeLocation::addRandomModules) only picks module classes whose basevalue is at least 1, and the
+    # Remora RCS (AP-RCS1) has basevalue=2505, so it could turn up in shops, cheap and better than the shop RCS
+    # units.  Set to 0 so the module stays on the Remora but is never stocked.  (Restored: this entry was dropped
+    # by a later clean-up although the 0.4.0 changelog still listed it.)
+    "modules_npc.txt": [
+        (1, "    basevalue=2505\n", "    basevalue=0\n"),
+    ],
+
 
     # BUG-036 (GitHub issue #25): on the Enceladus, the airlock door
     # buttons' invisible click boxes (ColliderCube children with
