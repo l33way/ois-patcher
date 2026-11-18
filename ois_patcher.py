@@ -197,7 +197,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.4.1"
+PATCHER_VERSION = "0.4.2"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 64  # reserved bytes at the start of .ptch's raw data
 
@@ -2593,6 +2593,123 @@ def fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=F
 
 
 # ============================================================
+# Fix 36: autopilot: the ship keeps burning at the last second of an approach and never docks.
+#
+# The final-waypoint "decelerate" state (travel state 4) finishes when the ship is within 0.1 Gm of the waypoint
+# and slower than 0.3 Gm/s.  When it gets within 0.1 Gm but is still faster than 0.3 Gm/s (an approach at 1.3 Gm/s
+# with a strong drive such as the GX Delta at 100%) it logs "Overshot our mark slightly - too fast. Removing
+# waypoint and coming to a complete stop as close as we can." and does that by emptying the waypoint list and
+# re-entering state 4 (a no-op: it is already state 4).  The next tick finds no waypoint, logs "Motion complete.",
+# switches the autopilot OFF and returns -- without switching the main drive off.  The drive was burning on that
+# last tick (state 4 had just set it), and nothing turns it off again, so it burns forever and the ship is never
+# stopped or docked.  The comment says what was meant: come to a complete stop.  The branch now calls Ship::allStop
+# (the same call as the player's All Stop key): it leaves the single all-stop waypoint, performAllStopLogic turns
+# the ship retro and burns until it is stopped, and switches the drive off when it halts.
+#
+# Second change: performAllStopLogic halts when the speed is <= 0.1 Gm/s.  The drive changes the speed in discrete
+# ticks (efficiency * thrust * dt per tick), so a very strong drive can step from just above 0.1 to just above 0.1
+# on the other side of zero and never fall inside a window 0.2 wide, burning back and forth forever.  That is why
+# turning the drive down to 70% helped.  The halt now uses 0.3 Gm/s, the same speed the arrival test above already
+# accepts as "stopped", which a step of up to 0.6 Gm/s per tick cannot skip.
+# Client and server.  tools/autopilot/test_overshoot_stop.py runs both under emulation.
+# ============================================================
+
+def fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Autopilot: drive keeps burning after the last-second overshoot" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    if server:
+        OVER, HALT, ALLSTOP, C01, C03 = 0x00516F94, 0x00517175, 0x00518AF0, 0x0062EFB0, 0x0062EFE0
+    else:
+        OVER, HALT, ALLSTOP, C01, C03 = 0x00517A84, 0x00517C65, 0x005195E0, 0x006314F8, 0x00631528
+    # mov eax,[ebx] ; add esp,8 ; mov ecx,edi ; mov [ebx+4],eax ; push 4 ; call switchTravelState
+    if verify_site(data, pe, OVER, bytes.fromhex("8B0383C4088BCF8943046A04E8"), label + " (overshoot branch)") is None:
+        return bail(label, cave_cursor, server)
+    # movss xmm0,[0.1f] ; fstp [ebp-0x10] ; comiss xmm0,[ebp-0x10]   (the speed <= 0.1 halt test)
+    if verify_site(data, pe, HALT, bytes.fromhex("F30F1005") + struct.pack("<I", C01) + bytes.fromhex("D95DF00F2F45F0"),
+                   label + " (halt threshold)") is None:
+        return bail(label, cave_cursor, server)
+    # allStop begins `push ebp ; mov ebp,esp ; sub esp,0x24 ; push esi ; mov esi,ecx ; call clearWaypointFlags`
+    if verify_site(data, pe, ALLSTOP, bytes.fromhex("558BEC83EC2456 8BF1E8".replace(" ", "")), label + " (Ship::allStop)") is None:
+        return bail(label, cave_cursor, server)
+    neutralize_relocations(data, pe, OVER, 17, label)
+    off = va_to_offset(pe, OVER)
+    code = bytes.fromhex("83C408") + b"\x90" * 7 + bytes.fromhex("8BCF") + b"\xE8"
+    code += struct.pack("<i", ALLSTOP - (OVER + len(code) + 4))
+    assert len(code) == 17
+    data[off:off + 17] = code
+    # the 0.3f the arrival test already uses; the operand keeps its base-relocation entry (still an image address)
+    off = va_to_offset(pe, HALT + 4)
+    data[off:off + 4] = struct.pack("<I", C03)
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 37: saves with a LADAR installed no longer open once the data fix BUG-018 has renamed two module ids
+# (mkxladara2 -> mkxladr2 and mkxladarat -> mkxladrt; see apply_data_fixes.py).  A save stores each installed
+# module as a length-prefixed identifier string; the loader looks it up with GameData::getModuleClassWithIdentifier,
+# which no longer finds the old name.  Fix 11 turns the crash into an empty slot, but the ship loses its LADAR (and
+# anything wired to it).  The lookup now treats the two old ids as aliases of the new ones, so old saves load with
+# their LADAR in place and nothing needs to be edited by hand.  Saves written afterwards use the new ids.
+#
+# The identifier is passed by value (a 16-byte inline buffer at [ebp+8], length at [ebp+0x18], capacity at [ebp+0x1c];
+# the callee pops it with `ret 0x18`), so a cave at the top of the loop rewrites the caller's own temporary copy in
+# place when it is a 10-character inline string equal to one of the old ids -- no allocation, no other state touched.
+# Everything else (every other module, every other caller, any other length) goes straight through.  Client and
+# server.  tools/save/test_module_alias.py runs the real lookup under emulation.
+# ============================================================
+
+def fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Saves with a LADAR load again after the BUG-018 id rename" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    HOOK = 0x004A802A if server else 0x004A815A
+    BACK = HOOK + 7
+    # mov ebx,[ebp+8] ; push esi ; mov ecx,[eax+0xc]   -- inside GameData::getModuleClassWithIdentifier
+    if verify_site(data, pe, HOOK, bytes.fromhex("8B5D08568B480C"), label) is None \
+            or verify_site(data, pe, HOOK - 0x0A, bytes.fromhex("558BEC51A1"), label + " (entry)") is None:
+        return bail(label, cave_cursor, server)
+    c = bytearray()
+    jumps = []                                                      # (position of rel8, label name)
+
+    def emit(b):
+        c.extend(b)
+
+    def jcc(op, name):
+        jumps.append((len(c) + 1, name))
+        emit(bytes([op, 0]))
+
+    emit(bytes.fromhex("837D1C0F")); jcc(0x77, "done")              # cmp [ebp+0x1c],0xf ; ja done   (heap string)
+    emit(bytes.fromhex("837D180A")); jcc(0x75, "done")              # cmp [ebp+0x18],10 ; jne done
+    emit(bytes.fromhex("817D08") + b"mkxl"); jcc(0x75, "done")      # cmp dword [ebp+8],"mkxl"
+    emit(bytes.fromhex("817D0C") + b"adar"); jcc(0x75, "done")      # cmp dword [ebp+0xc],"adar"
+    emit(bytes.fromhex("0FB74D10"))                                 # movzx ecx,word [ebp+0x10]
+    emit(bytes.fromhex("6681F9") + b"a2"); jcc(0x74, "id2")         # cmp cx,"a2" ; je id2
+    emit(bytes.fromhex("6681F9") + b"at"); jcc(0x75, "done")        # cmp cx,"at" ; jne done
+    emit(bytes.fromhex("C7450C") + b"adrt"); jcc(0xEB, "fix")       # [ebp+0xc]="adrt" ; jmp fix
+    labels = {"id2": len(c)}
+    emit(bytes.fromhex("C7450C") + b"adr2")                         # id2: [ebp+0xc]="adr2"
+    labels["fix"] = len(c)
+    emit(bytes.fromhex("C6451000"))                                 # fix: byte [ebp+0x10]=0   -> "mkxladr2"/"mkxladrt"
+    emit(bytes.fromhex("C7451808000000"))                           # length = 8
+    labels["done"] = len(c)
+    emit(bytes.fromhex("8B5D08568B480C"))                           # the displaced instructions
+    cave_va = ptch_va + cave_cursor
+    emit(b"\xE9" + _rel32(cave_va, len(c), BACK, 1))
+    for pos, name in jumps:
+        rel = labels[name] - (pos + 1)
+        assert 0 <= rel <= 127
+        c[pos] = rel
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c)] = c
+    neutralize_relocations(data, pe, HOOK, 7, label)
+    off = va_to_offset(pe, HOOK)
+    data[off:off + 7] = b"\xE9" + struct.pack("<i", cave_va - (HOOK + 5)) + b"\x90\x90"
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor + len(c) + (-len(c) % 4)
+
+
+# ============================================================
 # Fix 33: some NPC ships turn up with their IFF off ("Unknown" in red on the nav map) and
 # "Turning my reactors off" in the debug log, on some machines and not on others -- Leslie
 # Garbut's SS Jolly Rancher in the intro, for one.  ShipBehaviour (0x164 bytes, allocated
@@ -2951,6 +3068,8 @@ def patch_server_exe(exe_path):
     cave_cursor = fix_pds_torpedoes(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
 
     # --- PLUGIN HOOK (the user already chose variants in begin_run) ---
@@ -4144,6 +4263,8 @@ def main():
     cave_cursor = fix_pds_hit_chance_label(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)

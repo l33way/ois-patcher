@@ -146,8 +146,8 @@ Still stuck? [Open an issue on GitHub](https://github.com/l33way/ois-patcher/iss
 
 See **[CHANGELOG.md](CHANGELOG.md)** for the full release history, issue links, and detailed technical breakdown of all 33+ binary and data fixes. Highlights include:
 
-- **Crash Fixes:** Fixes the **station-to-ship transition crash**, **Pirate Hunt** scenario crashes on both client and co-op server, **LADAR equip & save-load crashes**, **PDA portrait-render crashes**, **post-hull-destruction monitor crashes**, **engineering addon drag crashes**, and **terminal `DEL` command crashes**.
-- **Gameplay & Ship Systems:** Point-defence lasers now actually shoot down incoming torpedoes, autopilot no longer burns away after overshooting or drains batteries at max cruise speed, power drain UI and actual battery draw now respect component power modifiers, standalone scenarios no longer overwrite campaign Save Slot 1, and Full Stop while docked no longer bypasses undocking fees/airlocks.
+- **Crash Fixes:** Fixes the **station-to-ship transition crash**, **Pirate Hunt** scenario crashes on both client and co-op server, **LADAR equip & save-load crashes**, **PDA portrait-render crashes**, **post-hull-destruction monitor crashes**, **older saves with a LADAR no longer failing to open**, **engineering addon drag crashes**, and **terminal `DEL` command crashes**.
+- **Gameplay & Ship Systems:** Point-defence lasers now actually shoot down incoming torpedoes, autopilot no longer burns away after overshooting, burns on forever at the last second of an approach, or drains batteries at max cruise speed, power drain UI and actual battery draw now respect component power modifiers, standalone scenarios no longer overwrite campaign Save Slot 1, and Full Stop while docked no longer bypasses undocking fees/airlocks.
 - **Modules & Co-op:** Fixes broken GRA 5 and LADAR component slots, prevents NPC-only modules from appearing in shops, restores the 71 unused module-purchase welcome emails, fixes the unloadable *"Escort: Make a Break"* co-op scenario, and fixes *"Quit to Menu / Quit to OS"* freezing LAN clients.
 - **Audio, UI & Text:** Fixes the music player handle-leak failure loop, missing station terminal beeps/clicks, hidden *"Decrease Main Drive Power"* keybind, cabin scroll-wheel zoom-out, Enceladus button alignments, console damage displays, and ~450 spelling/grammar mistakes across ~320 game text files (including the broken `$amonut` reward token and dozens of permanently broken dialogue progression flags).
 
@@ -159,6 +159,7 @@ Keep all of these files together in the same folder:
 
 - **`ois_patcher.py`** — The main script you run (or double-click).
 - **`apply_data_fixes.py`** — Imported automatically by `ois_patcher.py` to generate the `oisbugfix` mod from your local `assets/` files.
+- **`dll_update.py`** — Optional refresh of the game's bundled DLLs; only used when a plugin asks first.
 - **`text_fixes.py`** — Spelling, grammar, and quest logic correction snippets loaded automatically by `apply_data_fixes.py`.
 - **`mod/oisbugfix/`** — Contains `modinfo.txt`; populated at install time by `apply_data_fixes.py`.
 
