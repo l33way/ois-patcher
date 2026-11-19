@@ -2841,6 +2841,70 @@ def fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
 
 
 # ============================================================
+# Fix 41: the shop's solar-wing "Range" rating is "Bad" for every solar wing (and "V. Bad" can never appear).
+#
+# Cut-offs on the wing's `range` (class+0x104): below 0 V. Bad (never), below 1.4 Bad, below 1.6 Medium, below 1.8 Good,
+# otherwise V. Good.  The four solar wings have a range of 1.05 to 1.35, all "Bad".  The cut-offs are now 1.1 / 1.15 /
+# 1.28 / 1.4: SLSP AE (1.05) V. Bad, SLSP (1.2) Medium, E SOLAR and E SOLAR MK 2 (1.35) Good.  (Gen. Rate already spreads
+# Bad to V. Good over the real wings and is untouched.)  Same technique as Fix 40: three of the compares are `comiss
+# xmm0,[shared constant]` and become a call to a cave stub with its own constant; the last is `comiss xmm0,xmm1 ; jb`
+# (zero in XMM1), 5 bytes, replaced by a call to a stub that makes the same decision and returns to the same two places.
+# Client only.  tools/ui/test_solar_range_rating.py runs all four compares under emulation.
+# ============================================================
+
+SOLAR_RANGE_SITES = ((0x00494548, 1.8, 1.4), (0x00494559, 1.6, 1.28), (0x0049456A, 1.4, 1.15))
+SOLAR_RANGE_LAST = (0x0049457B, 1.1)               # comiss xmm0,xmm1 ; jb 0x494588   (falls through to 0x494580)
+
+
+def fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop solar-wing Range rating spread across the real wings (1.05-1.35)"
+    for va, old, _ in SOLAR_RANGE_SITES:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if abs(got - old) > 1e-6:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    last_va, last_new = SOLAR_RANGE_LAST
+    if verify_site(data, pe, last_va, bytes.fromhex("0F2FC17208FF3590FA5D00"), label + " (zero compare)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    cave = bytearray()
+    for va, _, new in SOLAR_RANGE_SITES:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    cave_va = ptch_va + cave_cursor + len(cave)
+    stub = bytearray(bytes.fromhex("50" "E800000000" "58"))
+    pop_va = cave_va + len(stub) - 1
+    const_va = cave_va + 23
+    stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)       # comiss xmm0,[eax+delta]
+    stub += bytes.fromhex("58")                                                  # pop eax (flags kept)
+    stub += bytes.fromhex("7201" "C3")                                           # jb below ; ret  -> falls through to +5
+    stub += bytes.fromhex("83042408" "C3")                                       # below: add [esp],8 ; ret -> 0x494588
+    stub += struct.pack("<f", last_new)
+    assert len(stub) == 27 and len(stub) - 4 == 23
+    cave += stub
+    off = va_to_offset(pe, last_va)
+    data[off:off + 5] = b"\xE8" + struct.pack("<i", cave_va - (last_va + 5))
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
 # Fix 33: some NPC ships turn up with their IFF off ("Unknown" in red on the nav map) and
 # "Turning my reactors off" in the debug log, on some machines and not on others -- Leslie
 # Garbut's SS Jolly Rancher in the intro, for one.  ShipBehaviour (0x164 bytes, allocated
@@ -4400,6 +4464,7 @@ def main():
     cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
