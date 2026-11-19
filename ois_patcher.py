@@ -2791,6 +2791,56 @@ def fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor):
 
 
 # ============================================================
+# Fix 40: the mechanic/shop's jump-drive "Range" rating is useless: every drive reads "V. Bad" or "Bad".
+#
+# The rating compares the drive's `jumpdistance` (class+0x104) with fixed cut-offs 240 / 280 / 300 / 360 (V. Bad below
+# 240, Bad below 280, Medium below 300, Good below 360, otherwise V. Good), but the game's nine jump drives span only
+# 160 to 260, so seven are "V. Bad" and two are "Bad".  The cut-offs are now 180 / 205 / 225 / 245, which spreads the
+# nine drives 1 / 2 / 3 / 1 / 2 across V. Bad .. V. Good (DVJD-400 V. Bad; DVJD-450 and -500 Bad; DVJD-600, KIJD-140R and
+# -140S Medium; KIJD-140 Good; KIJD-10 and -20 V. Good).  The four `comiss xmm0,[constant]` are shared constants (360.0
+# is also an angle wrap), so they cannot be edited in place; each one becomes a `call` to a four-instruction stub in
+# the cave that compares against its own constant (PIC, so no relocation entry is needed; POP and RET keep the flags
+# that the compare set).  Client only.  tools/ui/test_jump_range_rating.py runs the four compares under emulation.
+# ============================================================
+
+JUMP_RANGE_SITES = ((0x0049441A, 360.0, 245.0), (0x0049442B, 300.0, 225.0), (0x0049443C, 280.0, 205.0),
+                    (0x0049444D, 240.0, 180.0))
+
+
+def fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop jump-drive Range rating spread across the real drives (160-260)"
+    consts = {}
+    for va, old, _ in JUMP_RANGE_SITES:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if got != old:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    cave = bytearray()
+    for va, old, new in JUMP_RANGE_SITES:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1                    # the float follows comiss, pop eax, ret
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        assert len(stub) == 20
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
 # Fix 33: some NPC ships turn up with their IFF off ("Unknown" in red on the nav map) and
 # "Turning my reactors off" in the debug log, on some machines and not on others -- Leslie
 # Garbut's SS Jolly Rancher in the intro, for one.  ShipBehaviour (0x164 bytes, allocated
@@ -4349,6 +4399,7 @@ def main():
     cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
