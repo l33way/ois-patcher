@@ -2710,6 +2710,87 @@ def fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
 
 
 # ============================================================
+# Fix 38: weapon spin-up time goes the wrong way with efficiency.
+#
+# A launcher or gun tube's spin-up time is `spinuptime * 0.5 * efficiency/100` seconds (the 0.5 is the game's own
+# scale).  Every other timed thing in the game gets *slower* as a module's efficiency drops (reload is
+# `reload * (2 - efficiency/100)`), but here a damaged or low-efficiency weapon spun up *faster* and a boosted one
+# slower.  The fix makes the figure `spinuptime * 0.5 * (2 - efficiency/100)`, the same rule as reload: at 100% nothing
+# changes.  There are seven places that compute it (ShipModule::runLogic where the timer is started, Ship::fireWeapon,
+# doSetWeaponTarget, getTubeSpinUpPercent, getTubeSummary, getTubeAdvancedSummary and UI_WeaponTubes::render), each
+# a `call ShipModule::getEfficiencyPercent`.  All seven now call one small stub instead: it calls the real function
+# and returns 200 - efficiency (so x/100 becomes 2 - x/100), leaving every other register and the stack as the real
+# function leaves them.  Client and server.  tools/spinup/test_spinup.py runs all seven sites under emulation.
+# ============================================================
+
+SPINUP_SITES = {
+    False: (0x4AF43D, 0x510400, 0x4E3D40, 0x4ECC13, 0x4F0F8C, 0x4F1553, 0x590360),
+    True: (0x4AF2ED, 0x50FCA0, 0x4E3830, 0x4EC673, 0x4F09FC, 0x4F0FC3, 0x58E630),
+}
+
+
+def fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Weapon spin-up time grows as efficiency drops, like reload" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    sites = SPINUP_SITES[bool(server)]
+    targets = set()
+    for va in sites:
+        if verify_site(data, pe, va, bytes([0xE8]), label + f" (call at {va:#x})") is None:
+            return bail(label, cave_cursor, server)
+        targets.add(_rel32_target(data, pe, va, 1))
+    if len(targets) != 1:
+        print(f"  [SKIP] {label}: the seven sites do not call the same function")
+        return bail(label, cave_cursor, server)
+    GET_EFF = targets.pop()
+    cave_va = ptch_va + cave_cursor
+    stub = bytearray(b"\xE8" + _rel32(cave_va, 0, GET_EFF, 1))      # call ShipModule::getEfficiencyPercent
+    stub += bytes.fromhex("F7D8" "05C8000000" "C3")                   # neg eax ; add eax,200 ; ret
+    stub += b"\x90" * (-len(stub) % 4)
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(stub)] = stub
+    for va in sites:
+        off = va_to_offset(pe, va)
+        data[off + 1: off + 5] = struct.pack("<i", cave_va - (va + 5))
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor + len(stub)
+
+
+# ============================================================
+# Fix 39: two shop / mechanic stat labels that mislead.
+#
+#  * Sensor suites list a "Strength" rating.  It is the module's emission sensitivity (how faint an emission it can
+#    pick up; the same value the developers called `strength`), not signal strength or power, so players read it as
+#    the wrong thing.  Relabelled "Detection".
+#  * A grappling arm lists "Speed : N", but N is how long a use takes, so a LOWER number is the quicker arm -- the
+#    opposite of how every other "Speed"/"Rot. Speed" line reads.  Relabelled "Use Time".
+# Both are same-length replacements of the format strings in .rdata (referenced by one `push` each in the shop text
+# builder), so no code changes.  Only the label text changes, not the value or its colour.  Client only.
+# tools/ui/test_shop_labels.py checks the strings and their references.
+# ============================================================
+
+SHOP_LABELS = (
+    # (VA of the format string, original, replacement)
+    (0x0060E264, b"`7Strength  : %s\n", b"`7Detection : %s\n"),
+    (0x0060E134, b"`7Speed     : `!%.0f\n", b"`7Use Time  : `!%.0f\n"),
+)
+
+
+def fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop stat labels: sensor 'Strength' -> 'Detection', grappling arm 'Speed' -> 'Use Time'"
+    for va, old, new in SHOP_LABELS:
+        assert len(old) == len(new)
+        if verify_site(data, pe, va, old + b"\x00", label) is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    for va, old, new in SHOP_LABELS:
+        off = va_to_offset(pe, va)
+        data[off:off + len(new)] = new
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
 # Fix 33: some NPC ships turn up with their IFF off ("Unknown" in red on the nav map) and
 # "Turning my reactors off" in the debug log, on some machines and not on others -- Leslie
 # Garbut's SS Jolly Rancher in the intro, for one.  ShipBehaviour (0x164 bytes, allocated
@@ -3070,6 +3151,7 @@ def patch_server_exe(exe_path):
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
 
     # --- PLUGIN HOOK (the user already chose variants in begin_run) ---
@@ -4265,6 +4347,8 @@ def main():
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
