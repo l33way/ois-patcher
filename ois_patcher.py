@@ -2760,7 +2760,7 @@ def fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
 #
 #  * Sensor suites list a "Strength" rating.  It is the module's emission sensitivity (how faint an emission it can
 #    pick up; the same value the developers called `strength`), not signal strength or power, so players read it as
-#    the wrong thing.  Relabelled "Detection".
+#    the wrong thing.  Relabelled "Detect Rng" (how far out it picks up emissions).
 #  * A grappling arm lists "Speed : N", but N is how long a use takes, so a LOWER number is the quicker arm -- the
 #    opposite of how every other "Speed"/"Rot. Speed" line reads.  Relabelled "Use Time".
 # Both are same-length replacements of the format strings in .rdata (referenced by one `push` each in the shop text
@@ -2770,13 +2770,13 @@ def fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
 
 SHOP_LABELS = (
     # (VA of the format string, original, replacement)
-    (0x0060E264, b"`7Strength  : %s\n", b"`7Detection : %s\n"),
+    (0x0060E264, b"`7Strength  : %s\n", b"`7Detect Rng: %s\n"),
     (0x0060E134, b"`7Speed     : `!%.0f\n", b"`7Use Time  : `!%.0f\n"),
 )
 
 
 def fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor):
-    label = "Shop stat labels: sensor 'Strength' -> 'Detection', grappling arm 'Speed' -> 'Use Time'"
+    label = "Shop stat labels: sensor 'Strength' -> 'Detect Rng', grappling arm 'Speed' -> 'Use Time'"
     for va, old, new in SHOP_LABELS:
         assert len(old) == len(new)
         if verify_site(data, pe, va, old + b"\x00", label) is None:
@@ -2899,6 +2899,68 @@ def fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
     off = va_to_offset(pe, last_va)
     data[off:off + 5] = b"\xE8" + struct.pack("<i", cave_va - (last_va + 5))
     data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
+# Fix 42: the sensor-suite page of the shop/mechanic.
+#
+#  * "Range : 0Gm" is printed from a field sensors never fill in (class+0x108), so every sensor reads 0Gm.  The line is
+#    dropped for sensors by pointing its one `push` at an empty string (the same format string is still used, with real
+#    values, by the other module types that print a range).
+#  * "Detect Rng" (sensorquality, class+0xE4) was rated against 0.8 / 1.0 / 1.2 / 1.4, but the real sensors span 0.4 to
+#    1.3, so none ever reached "V. Good" (only the Remora's RM-SNS at 5 did).  Cut-offs are now 0.55 / 0.75 / 0.95 / 1.15,
+#    which spreads the eleven sensors 1 / 2 / 3 / 3 / 2 across V. Bad .. V. Good.
+#  * "Sns. Ghsts" is rated from the `ghosttimer` dice (NdM+K as count * ((sides+1)/2) + K; a longer timer means fewer
+#    ghosts, rated Low) against 90 / 115 / 135 / 170, but the real sensors work out to 190-385, so every one read "V. Low"
+#    while the Probe Sensor (about 72) read "V. High".  Cut-offs are now 180 / 220 / 250 / 300: Probe Sensor V. High, D2/D4
+#    High, C1/C5 Moderate, SL/SM/SQ/RM Low, T0/M1/M2/T9 V. Low.
+# The compares are `comiss xmm0,[shared constant]`; as in Fix 40 each becomes a call to a cave stub with its own constant.
+# Client only.  tools/ui/test_sensor_ratings.py runs the compares under emulation.
+# ============================================================
+
+SENSOR_GHOST_SITES = ((0x00493D34, 170.0, 300.0), (0x00493D45, 135.0, 250.0), (0x00493D56, 115.0, 220.0),
+                      (0x00493D67, 90.0, 180.0))
+SENSOR_DETECT_SITES = ((0x00493FA2, 1.4, 1.15), (0x00493FB3, 1.2, 0.95), (0x00493FC4, 1.0, 0.75), (0x00493FD5, 0.8, 0.55))
+SENSOR_RANGE_PUSH, SENSOR_RANGE_STRING, EMPTY_STRING = 0x00493CBC, 0x0060E0F4, 0x0060E275
+
+
+def fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Sensor page: no bogus Range line, Detect Rng and Sns. Ghsts ratings spread over the real sensors"
+    sites = SENSOR_GHOST_SITES + SENSOR_DETECT_SITES
+    for va, old, _ in sites:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if abs(got - old) > 1e-5:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    if verify_site(data, pe, SENSOR_RANGE_PUSH, bytes([0x68]) + struct.pack("<I", SENSOR_RANGE_STRING), label + " (Range push)") is None \
+            or verify_site(data, pe, EMPTY_STRING, b"\x00\x00\x00", label + " (empty string)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    cave = bytearray()
+    for va, _, new in sites:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    # the sensor's Range line: same push, empty format string (the operand keeps its base-relocation entry)
+    off = va_to_offset(pe, SENSOR_RANGE_PUSH + 1)
+    data[off:off + 4] = struct.pack("<I", EMPTY_STRING)
     print(f"  [OK] {label}")
     FIXES_APPLIED.append(label)
     return cave_cursor + len(cave)
@@ -4465,6 +4527,7 @@ def main():
     cave_cursor = fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)

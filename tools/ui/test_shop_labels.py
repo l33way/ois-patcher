@@ -11,7 +11,7 @@ import sys
 
 import pefile
 
-CASES = (("sensor rating", 0x60E264, b"`7Strength  : %s\n", b"`7Detection : %s\n", 0x494011),
+CASES = (("sensor rating", 0x60E264, b"`7Strength  : %s\n", b"`7Detect Rng: %s\n", 0x494011),
          ("grappling arm", 0x60E134, b"`7Speed     : `!%.0f\n", b"`7Use Time  : `!%.0f\n", 0x493978))
 
 
