@@ -4,7 +4,7 @@ dll_update.py -- optional refresh of the game's bundled 32-bit libraries.
 A Python port of the core of Patch_OIS.bat from https://github.com/Voidless7125/OIS-Update
 (branch `dev`): the same package layout, the same SHA256 manifest, the same marker files in
 the game folder, so Patch_OIS.bat / OIS_Health_Check.bat still understand a game folder this
-module has updated.  Used by personal_variants.py, which asks the user before anything here runs.
+module has updated.  Used by ois_patcher.py, which asks the user before anything here runs.
 
 What it does
   1. Finds the update package: a local copy (an extracted OIS-Update[-dev] folder next to this
@@ -154,12 +154,26 @@ def check_package(pkg):
     return missing, bad
 
 
+_extra_search_dirs = []
+
+
+def add_search_dir(path):
+    """Also look for a local package inside `path` and next to it (the patcher adds the game folder, so an
+    OIS-Update folder dropped into, or beside, the game folder is found even if the patcher lives elsewhere)."""
+    p = Path(path).resolve()
+    if p not in _extra_search_dirs:
+        _extra_search_dirs.append(p)
+
+
 def find_local_package():
     cands = []
     env = os.environ.get(ENV_PACKAGE_DIR)
     if env:
         cands.append(Path(env.strip().strip('"')))
-    for base in (HERE, HERE.parent):
+    bases = [HERE, HERE.parent]
+    for d in _extra_search_dirs:
+        bases += [d, d.parent]
+    for base in bases:
         cands.extend(base / n for n in PACKAGE_DIRNAMES)
     for c in cands:
         pkg = load_package(c) if c.is_dir() else None

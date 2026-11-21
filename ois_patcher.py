@@ -3920,6 +3920,144 @@ def restore_news_info(game_dir, keep_backup=False):
     return True
 
 
+# ============================================================
+# Optional DLL refresh (dll_update.py, a port of OIS-Update's Patch_OIS.bat)
+#
+# The game ships with 2018-era libraries (OpenAL, curl, zlib, libtiff, ...). The OIS-Update package
+# (github.com/Voidless7125/OIS-Update) has newer builds of them. This step is always optional and always asked:
+#   - an OIS-Update folder found next to this script, in or beside the game folder, or named by
+#     %OIS_UPDATE_DIR%  -> "update the DLLs from it?"
+#   - none found          -> "download it and update the DLLs?"  (about 25 MB, every file checked against the
+#     package's own SHA256 manifest before it is used)
+# --yes alone never opts in (it would otherwise download and replace libraries unattended); --dll-update does,
+# --no-dll-update never asks. The copy happens after the exe and data fixes, so a failed exe patch never leaves
+# half an update behind. The firewall rules, repair shortcut and install ping of Patch_OIS.bat are left out.
+# ============================================================
+
+_DLL = {"pkg": None, "go": False, "result": None}
+
+
+def _dll_module():
+    try:
+        import dll_update
+    except ModuleNotFoundError as e:
+        if e.name != "dll_update":
+            raise
+        return None
+    return dll_update
+
+
+def _dll_current(du, game_dir, pkg):
+    return all((game_dir / n).is_file() and du.sha256_file(game_dir / n) == s for n, s in pkg.game)
+
+
+def dll_begin(game_dir, mode=None):
+    """Asks (once, before anything is patched) and, on yes, gets a verified package. `mode` is None to ask,
+    True for --dll-update, False for --no-dll-update. Never raises: a problem here only skips the DLL step."""
+    _DLL.update(pkg=None, go=False, result=None)
+    du = _dll_module()
+    if du is None or mode is False:
+        return
+    game_dir = Path(game_dir)
+    try:
+        du.add_search_dir(game_dir)
+        pkg = du.find_local_package()
+        if pkg is not None:
+            missing, bad = du.check_package(pkg)
+            if not missing and not bad and _dll_current(du, game_dir, pkg):
+                print(f"\nGame DLLs: already match OIS-Update {pkg.version}; nothing to do.")
+                return
+            if missing or bad:
+                print(f"\nGame DLLs: the OIS-Update folder at {pkg.root} is incomplete or altered "
+                      f"({len(missing)} missing, {len(bad)} with the wrong SHA256).")
+                pkg = None
+            else:
+                print(f"\nGame DLLs: OIS-Update {pkg.version} found at {pkg.root}.")
+        if pkg is None and not mode and (du.load_state(game_dir) or du.read_installed_manifest(game_dir)):
+            return        # already updated earlier and no package on disk: don't nag on every run
+        if pkg is None:
+            print("\nGame DLLs: the game ships with 2018 libraries; OIS-Update has newer ones.")
+            question = ("  Download OIS-Update (about 25 MB, from github.com/Voidless7125/OIS-Update) and update "
+                        "the game's DLLs?")
+        else:
+            question = "  Update the game's DLLs from it?"
+        print("  Originals are backed up to oisbugfix_original_dlls/ and put back by --uninstall; "
+              "every file is checked against the package's SHA256 manifest.")
+        if mode:
+            go = True
+        elif sys.stdin.isatty():
+            try:
+                go = input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                go = False
+        else:
+            print("  [SKIP] Not an interactive session; add --dll-update to do this unattended.")
+            go = False
+        if not go:
+            return
+        if pkg is None:
+            print("  Getting the package...")
+            pkg = du.obtain_package()
+            if pkg is None:
+                print("  [SKIP] No usable package, so the DLLs will not be touched. (The other fixes go ahead.)")
+                return
+        _DLL.update(pkg=pkg, go=True)
+    except Exception as e:                       # network, disk, anything: never take the patch down with it
+        print(f"  [SKIP] DLL update unavailable: {e}")
+        _DLL.update(pkg=None, go=False)
+
+
+def dll_apply(game_dir):
+    if not _DLL["go"]:
+        return
+    du = _dll_module()
+    print("\nUpdating the game's DLLs...")
+    try:
+        ok = bool(du.install(Path(game_dir), package=_DLL["pkg"]))
+    except Exception as e:
+        print(f"      [ERROR] {e}")
+        ok = False
+    _DLL["result"] = ok
+    print(f"  [{'OK' if ok else 'FAILED'}] DLL update"
+          + ("" if ok else " (see above; the exe and data fixes are unaffected)"))
+
+
+def dll_summary_lines():
+    if not _DLL["go"]:
+        return []
+    return [f"DLL update: {'applied' if _DLL['result'] else 'FAILED, see above'}"]
+
+
+def dll_status_lines(game_dir):
+    du = _dll_module()
+    if du is None:
+        return []
+    game_dir = Path(game_dir)
+    du.add_search_dir(game_dir)
+    lines = list(du.status_lines(game_dir))
+    pkg = du.find_local_package()
+    if pkg is not None and not any(du.check_package(pkg)) and not _dll_current(du, game_dir, pkg):
+        lines.append(f"  {'':<16} OIS-Update {pkg.version} is on disk at {pkg.root}; run the patcher to apply it")
+    return lines
+
+
+def dll_uninstall_plan(game_dir):
+    du = _dll_module()
+    if du is None:
+        return []
+    du.add_search_dir(game_dir)
+    return du.uninstall_plan(game_dir)
+
+
+def dll_uninstall(game_dir, keep_backups=False):
+    du = _dll_module()
+    if du is None:
+        return True
+    du.add_search_dir(game_dir)
+    return bool(du.uninstall(Path(game_dir), keep_backups))
+
+
 def print_status(game_dir):
     game_dir = Path(game_dir)
     print(f"Install: {game_dir}")
@@ -3940,6 +4078,8 @@ def print_status(game_dir):
     print(f"  {'bugfix mod':<16} {'installed at ' + str(mod_dir) if mod_dir.is_dir() else 'not installed'}")
     n = len(saved_originals(game_dir))
     print(f"  {'news/info text':<16} {f'{n} article(s) corrected in place; originals in {ORIGINALS_DIRNAME}/' if n else 'not modified'}")
+    for line in dll_status_lines(game_dir):
+        print(line)
     for line in _plugin_call("status_lines", game_dir, default=[]) or []:
         print(line)
 
@@ -3990,7 +4130,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
     print(f"  {'news/info text':<16} "
           f"{str(len(news_saved)) + ' corrected article(s), originals saved' if news_saved else 'not modified'}")
 
-    plugin_items = _plugin_call("uninstall_plan", game_dir, default=[]) or []
+    dll_items = dll_uninstall_plan(game_dir)
+    plugin_items = dll_items + (_plugin_call("uninstall_plan", game_dir, default=[]) or [])
     if not restorable and not mod_present and not news_saved and not plugin_items:
         print("\nNothing installed by this script was found -- nothing to undo.")
         return True
@@ -4023,7 +4164,9 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
         remove_mod(game_dir)
     if news_saved:
         ok = restore_news_info(game_dir, keep_backup=keep_backups) and ok
-    if plugin_items:
+    if dll_items:
+        ok = dll_uninstall(game_dir, keep_backups) and ok
+    if len(plugin_items) > len(dll_items):
         ok = bool(_plugin_call("uninstall", game_dir, keep_backups, default=True)) and ok
 
     print("\n" + "=" * 60)
@@ -4034,8 +4177,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
               "patched and stock files; verifying the game files through Steam or GOG is the\n"
               "safest way back to a clean state.")
     print("\nNote: this only undoes what ois_patcher.py did. Anything installed by\n"
-          "Patch_OIS.bat (its own Backup folder, OIS_Update.version.txt, firewall rules)\n"
-          "is separate -- run that script with -uninstall for those.")
+          "Patch_OIS.bat itself (its own Backup folder, firewall rules) is separate --\n"
+          "run that script with -uninstall for those.")
     return ok
 
 
@@ -4366,6 +4509,11 @@ def main():
                         help="Re-patch from the backup even when the install is already current.")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Answer yes to confirmation prompts (for unattended runs).")
+    parser.add_argument("--dll-update", action="store_true",
+                        help="Also update the game's DLLs from the OIS-Update package (found on disk, "
+                             "otherwise downloaded) without asking.")
+    parser.add_argument("--no-dll-update", action="store_true",
+                        help="Do not offer the optional DLL update.")
     parser.add_argument("--update", action="store_true",
                         help="Check the git checkout for a newer patcher and apply it without "
                              "asking, then re-run.")
@@ -4375,6 +4523,7 @@ def main():
                         help="With --uninstall, leave the .original-backup files in place "
                              "instead of deleting them after a verified restore.")
     args = parser.parse_args()
+    dll_mode = True if args.dll_update else (False if args.no_dll_update else None)
 
     if args.list_installs:
         found = find_game_dirs()
@@ -4434,11 +4583,13 @@ def main():
     if action == "mod-only":
         # exes are current: variants that live in the exe can't change now, the others can still be chosen
         _plugin_call("begin_run", game_dir, args.yes, exe_patching=False)
+        dll_begin(game_dir, dll_mode)
         print("\nRefreshing data-only bugfix mod...")
         mod_installed = install_mod(exe_path)
         print(f"\nBugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
         _plugin_call("post_install", game_dir)
-        for line in _plugin_call("summary_lines", default=[]) or []:
+        dll_apply(game_dir)
+        for line in dll_summary_lines() + (_plugin_call("summary_lines", default=[]) or []):
             print(line)
         print("Exe fixes: already up to date, nothing changed.")
         sys.exit(0)
@@ -4448,6 +4599,7 @@ def main():
 
     # Optional personal variants (personal_variants.py): asked one at a time, before anything is patched.
     _plugin_call("begin_run", game_dir, args.yes)
+    dll_begin(game_dir, dll_mode)
 
     print(f"\nPatching: {exe_path}")
 
@@ -4552,6 +4704,7 @@ def main():
     mod_installed = install_mod(exe_path)
 
     _plugin_call("post_install", game_dir)
+    dll_apply(game_dir)
 
     print(f"\n{'='*60}")
     print(f"Applied {len(FIXES_APPLIED)} exe fix(es), skipped {len(FIXES_SKIPPED)}.")
@@ -4564,7 +4717,7 @@ def main():
     else:
         print("ois_server.exe: not patched, see above (only matters for hosting/joining co-op games).")
     print(f"Bugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
-    for line in _plugin_call("summary_lines", default=[]) or []:
+    for line in dll_summary_lines() + (_plugin_call("summary_lines", default=[]) or []):
         print(line)
     print(f"\nPatched: {exe_path}")
     print(f"Original backed up at: {backup_path}")
