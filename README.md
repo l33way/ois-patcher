@@ -23,11 +23,15 @@ Every fix in this patch exists because something the developers clearly intended
 
 ## Why a Python script instead of a pre-patched `ois.exe`?
 
-Distributing a source script that patches your own installation rather than a pre-modified `.exe` is a deliberate security and copyright choice:
+Mostly so you can see what it does, and so nobody has to share the game itself:
 
-1. **Visibility & Security:** Anyone can read `ois_patcher.py` and `apply_data_fixes.py` to inspect every exact byte and file modified, rather than trusting an opaque binary from the internet.
-2. **No Redistributed Game Assets:** Both the binary patches and data fixes are generated on the fly from your own local `Objects in Space` installation, so Flat Earth Games' copyrighted files are never bundled in this repository.
-3. **Universal Compatibility:** This byte-by-byte "match" behavior applies regardless of where the exe came from.
+1. **You can read it.** `ois_patcher.py` and `apply_data_fixes.py` list every byte and every text line they change. No mystery
+   binary from the internet.
+2. **No game files are shared.** Both the binary patches and the data fixes are built on the spot from your own copy of the game.
+3. **It works on any copy of the same game version.** Each fix is matched byte for byte against what it expects and skipped if
+   it does not recognise the code.
+
+See [SECURITY.md](SECURITY.md) for what it touches on your computer (short version: the game folder, nothing else).
 
 ---
 
@@ -113,7 +117,20 @@ If you run `ois_patcher.py` from Command Prompt or PowerShell, you can pass thes
 | `py ois_patcher.py --status` | Shows whether your game is patched, which version is installed, and backup status without changing anything. |
 | `py ois_patcher.py --uninstall` | Restores your original `ois.exe`, `ois_server.exe`, and `assets/` files from backups and removes the `oisbugfix` mod. Leaves save games untouched. |
 | `py ois_patcher.py --force` | Forces a fresh re-patch from backup even if already on the current version. |
+| `py ois_patcher.py --dll-update` | Also updates the game's DLLs (see below) without asking. |
+| `py ois_patcher.py --no-dll-update` | Never offers the DLL update. |
 | `py ois_patcher.py --yes` | Skips confirmation prompts and exits immediately without waiting for a keypress (for scripts). |
+
+### Optional: Updating the Game's Old DLLs
+
+The game shipped in 2018 with the libraries of that year (cURL, zlib, SQLite, libtiff, OpenAL, ...). [OIS-Update](https://github.com/Voidless7125/OIS-Update) has newer builds of them, and the patcher can apply that for you. It is always optional:
+
+- If an `OIS-Update` folder is next to `ois_patcher.py` (or inside or beside the game folder), the patcher says so and asks whether to use it.
+- If there is none, it asks whether to **download** it (about 25 MB from GitHub). Say no and nothing is downloaded.
+- Every file is checked against the package's SHA256 manifest, your original DLLs are saved in `oisbugfix_original_dlls/`, and `--uninstall` puts them back. `--status` shows what is installed.
+- It does what `Patch_OIS.bat` does for the DLLs, but not the firewall rules, the repair shortcut or the install ping.
+- `--yes` on its own does not opt in (it would download and replace libraries unattended); use `--dll-update`.
+- Steam's "Verify integrity of game files" puts the old DLLs back; just run the patcher again. See [SECURITY.md](SECURITY.md) for the caveats.
 
 ### Manual Uninstall (If Needed)
 
@@ -146,8 +163,8 @@ Still stuck? [Open an issue on GitHub](https://github.com/l33way/ois-patcher/iss
 
 See **[CHANGELOG.md](CHANGELOG.md)** for the full release history, issue links, and detailed technical breakdown of all 33+ binary and data fixes. Highlights include:
 
-- **Crash Fixes:** Fixes the **station-to-ship transition crash**, **Pirate Hunt** scenario crashes on both client and co-op server, **LADAR equip & save-load crashes**, **PDA portrait-render crashes**, **post-hull-destruction monitor crashes**, **engineering addon drag crashes**, and **terminal `DEL` command crashes**.
-- **Gameplay & Ship Systems:** Point-defence lasers now actually shoot down incoming torpedoes, autopilot no longer burns away after overshooting or drains batteries at max cruise speed, power drain UI and actual battery draw now respect component power modifiers, standalone scenarios no longer overwrite campaign Save Slot 1, and Full Stop while docked no longer bypasses undocking fees/airlocks.
+- **Crash Fixes:** Fixes the **station-to-ship transition crash**, **Pirate Hunt** scenario crashes on both client and co-op server, **LADAR equip & save-load crashes**, **PDA portrait-render crashes**, **post-hull-destruction monitor crashes**, **older saves with a LADAR no longer failing to open**, **engineering addon drag crashes**, and **terminal `DEL` command crashes**.
+- **Gameplay & Ship Systems:** Point-defence lasers now actually shoot down incoming torpedoes, autopilot no longer burns away after overshooting, burns on forever at the last second of an approach, or drains batteries at max cruise speed, power drain UI and actual battery draw now respect component power modifiers, standalone scenarios no longer overwrite campaign Save Slot 1, and Full Stop while docked no longer bypasses undocking fees/airlocks.
 - **Modules & Co-op:** Fixes broken GRA 5 and LADAR component slots, prevents NPC-only modules from appearing in shops, restores the 71 unused module-purchase welcome emails, fixes the unloadable *"Escort: Make a Break"* co-op scenario, and fixes *"Quit to Menu / Quit to OS"* freezing LAN clients.
 - **Audio, UI & Text:** Fixes the music player handle-leak failure loop, missing station terminal beeps/clicks, hidden *"Decrease Main Drive Power"* keybind, cabin scroll-wheel zoom-out, Enceladus button alignments, console damage displays, and ~450 spelling/grammar mistakes across ~320 game text files (including the broken `$amonut` reward token and dozens of permanently broken dialogue progression flags).
 
@@ -159,6 +176,7 @@ Keep all of these files together in the same folder:
 
 - **`ois_patcher.py`** — The main script you run (or double-click).
 - **`apply_data_fixes.py`** — Imported automatically by `ois_patcher.py` to generate the `oisbugfix` mod from your local `assets/` files.
+- **`dll_update.py`** — The optional DLL refresh described above; only used if you say yes.
 - **`text_fixes.py`** — Spelling, grammar, and quest logic correction snippets loaded automatically by `apply_data_fixes.py`.
 - **`mod/oisbugfix/`** — Contains `modinfo.txt`; populated at install time by `apply_data_fixes.py`.
 

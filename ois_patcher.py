@@ -197,7 +197,7 @@ SERVER_FIXES_SKIPPED = []
 # already patched" refusal means "you already ran this exact version" or
 # "an older version patched this -- restore the backup and re-run to
 # upgrade", instead of one generic message either way.
-PATCHER_VERSION = "0.4.1"
+PATCHER_VERSION = "0.4.2"
 VERSION_MARKER_PREFIX = b"OISPATCH:"
 VERSION_MARKER_SIZE = 64  # reserved bytes at the start of .ptch's raw data
 
@@ -295,6 +295,20 @@ def _rel32(cave_va, at, target, opcode_len):
 def _fix_lists(server):
     """(applied, skipped) lists of the exe being patched."""
     return (SERVER_FIXES_APPLIED, SERVER_FIXES_SKIPPED) if server else (FIXES_APPLIED, FIXES_SKIPPED)
+
+
+def _plugin_call(name, *args, default=None, **kwargs):
+    """Calls personal_variants.<name>(...) when that optional plugin file exists and defines <name>;
+    otherwise returns `default`. Only a missing personal_variants.py is tolerated: an ImportError
+    raised from inside the plugin is a bug in it and is reported, not swallowed."""
+    try:
+        import personal_variants
+    except ModuleNotFoundError as e:
+        if e.name != "personal_variants":
+            raise
+        return default
+    fn = getattr(personal_variants, name, None)
+    return default if fn is None else fn(*args, **kwargs)
 
 
 def bail(label, cave_cursor, server=False):
@@ -2368,6 +2382,50 @@ def fix_news_enter_without_selection(data, pe, ptch_va, ptch_off, cave_cursor):
 
 
 # ============================================================
+# Fix 35: the mechanic / shop's "Hit Chce" figure for a point-defence laser is wrong.
+# Screen_UpgradeTerminal prints ((sides + 1) / 2) * count + constant, times 100, minus 100 -- the *average roll*
+# of the module's `hitchance=` dice as a percentage -- so 1d6 and 1d5 show "200%" and 1d4 and 1d3 show "100%"
+# (the weakest lasers look best).  The PDS actually hits when its dice come up 1 (ShipModule::runLogic:
+# `if (diceRoll(hitchance) == 1)`), i.e. one in N for a 1dN die: 16.7% for a PDL 101, 33% for an SDS 55L.  The
+# figure is now that chance, rounded to a whole percent; a dice expression that can never roll 1 (more than one
+# die, or a constant added) shows 0%.  In place, no cave: the 52-byte calculation ends with the percentage in EAX
+# (`cvttss2si eax,xmm1`) just before `push eax`, and the replacement is 48 bytes padded with NOPs.
+# ============================================================
+
+HITCHANCE_ORIGINAL = bytes.fromhex(
+    "8b81ec00000040992bc2d1f80faf81e80000000381f0000000660f6ec80f5bc9f30f590d64176300f30f5c0d64176300f30f2cc1")
+HITCHANCE_NEW = bytes.fromhex(
+    "8b81ec000000"              # MOV EAX,[ECX+0xEC]        sides
+    "83b9e800000001" "751f"     # CMP [ECX+0xE8],1          one die?                 JNE zero
+    "83b9f000000000" "7516"     # CMP [ECX+0xF0],0          nothing added?           JNE zero
+    "85c0" "7e12"               # TEST EAX,EAX              sides > 0?               JLE zero
+    "b8c8000000"                # MOV EAX,200
+    "31d2"                      # XOR EDX,EDX
+    "f7b1ec000000"              # DIV DWORD [ECX+0xEC]      200 / sides
+    "40" "d1e8"                 # INC EAX ; SHR EAX,1       (200/sides + 1) / 2 = 100/sides, rounded
+    "eb02"                      # JMP done
+    "31c0"                      # zero: XOR EAX,EAX
+)
+
+
+def fix_pds_hit_chance_label(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = 'Shop: point-defence "Hit Chce" shows the average roll (200%/100%) instead of the real 1-in-N chance'
+    SITE = 0x005511E6
+    if verify_site(data, pe, SITE, HITCHANCE_ORIGINAL, label) is None \
+            or verify_site(data, pe, SITE + len(HITCHANCE_ORIGINAL), bytes.fromhex("5068"), label + " (push eax)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    body = HITCHANCE_NEW + b"\x90" * (len(HITCHANCE_ORIGINAL) - len(HITCHANCE_NEW))
+    assert len(body) == len(HITCHANCE_ORIGINAL)
+    neutralize_relocations(data, pe, SITE, len(body), label)
+    off = va_to_offset(pe, SITE)
+    data[off:off + len(body)] = body
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
 # Fix 29: point-defence panel: a long manufacturer + name wraps onto a second line and
 # pushes everything below it into the ENABLE/DISABLE button.  ShipTextData formats
 # the first line of the PDS info as "`!%s `%%%s\n" (manufacturer, name) and the
@@ -2532,6 +2590,380 @@ def fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=F
     print(f"  [OK] {label}")
     applied.append(label)
     return cave_cursor
+
+
+# ============================================================
+# Fix 36: autopilot: the ship keeps burning at the last second of an approach and never docks.
+#
+# The final-waypoint "decelerate" state (travel state 4) finishes when the ship is within 0.1 Gm of the waypoint
+# and slower than 0.3 Gm/s.  When it gets within 0.1 Gm but is still faster than 0.3 Gm/s (an approach at 1.3 Gm/s
+# with a strong drive such as the GX Delta at 100%) it logs "Overshot our mark slightly - too fast. Removing
+# waypoint and coming to a complete stop as close as we can." and does that by emptying the waypoint list and
+# re-entering state 4 (a no-op: it is already state 4).  The next tick finds no waypoint, logs "Motion complete.",
+# switches the autopilot OFF and returns -- without switching the main drive off.  The drive was burning on that
+# last tick (state 4 had just set it), and nothing turns it off again, so it burns forever and the ship is never
+# stopped or docked.  The comment says what was meant: come to a complete stop.  The branch now calls Ship::allStop
+# (the same call as the player's All Stop key): it leaves the single all-stop waypoint, performAllStopLogic turns
+# the ship retro and burns until it is stopped, and switches the drive off when it halts.
+#
+# Second change: performAllStopLogic halts when the speed is <= 0.1 Gm/s.  The drive changes the speed in discrete
+# ticks (efficiency * thrust * dt per tick), so a very strong drive can step from just above 0.1 to just above 0.1
+# on the other side of zero and never fall inside a window 0.2 wide, burning back and forth forever.  That is why
+# turning the drive down to 70% helped.  The halt now uses 0.3 Gm/s, the same speed the arrival test above already
+# accepts as "stopped", which a step of up to 0.6 Gm/s per tick cannot skip.
+# Client and server.  tools/autopilot/test_overshoot_stop.py runs both under emulation.
+# ============================================================
+
+def fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Autopilot: drive keeps burning after the last-second overshoot" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    if server:
+        OVER, HALT, ALLSTOP, C01, C03 = 0x00516F94, 0x00517175, 0x00518AF0, 0x0062EFB0, 0x0062EFE0
+    else:
+        OVER, HALT, ALLSTOP, C01, C03 = 0x00517A84, 0x00517C65, 0x005195E0, 0x006314F8, 0x00631528
+    # mov eax,[ebx] ; add esp,8 ; mov ecx,edi ; mov [ebx+4],eax ; push 4 ; call switchTravelState
+    if verify_site(data, pe, OVER, bytes.fromhex("8B0383C4088BCF8943046A04E8"), label + " (overshoot branch)") is None:
+        return bail(label, cave_cursor, server)
+    # movss xmm0,[0.1f] ; fstp [ebp-0x10] ; comiss xmm0,[ebp-0x10]   (the speed <= 0.1 halt test)
+    if verify_site(data, pe, HALT, bytes.fromhex("F30F1005") + struct.pack("<I", C01) + bytes.fromhex("D95DF00F2F45F0"),
+                   label + " (halt threshold)") is None:
+        return bail(label, cave_cursor, server)
+    # allStop begins `push ebp ; mov ebp,esp ; sub esp,0x24 ; push esi ; mov esi,ecx ; call clearWaypointFlags`
+    if verify_site(data, pe, ALLSTOP, bytes.fromhex("558BEC83EC2456 8BF1E8".replace(" ", "")), label + " (Ship::allStop)") is None:
+        return bail(label, cave_cursor, server)
+    neutralize_relocations(data, pe, OVER, 17, label)
+    off = va_to_offset(pe, OVER)
+    code = bytes.fromhex("83C408") + b"\x90" * 7 + bytes.fromhex("8BCF") + b"\xE8"
+    code += struct.pack("<i", ALLSTOP - (OVER + len(code) + 4))
+    assert len(code) == 17
+    data[off:off + 17] = code
+    # the 0.3f the arrival test already uses; the operand keeps its base-relocation entry (still an image address)
+    off = va_to_offset(pe, HALT + 4)
+    data[off:off + 4] = struct.pack("<I", C03)
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 37: saves with a LADAR installed no longer open once the data fix BUG-018 has renamed two module ids
+# (mkxladara2 -> mkxladr2 and mkxladarat -> mkxladrt; see apply_data_fixes.py).  A save stores each installed
+# module as a length-prefixed identifier string; the loader looks it up with GameData::getModuleClassWithIdentifier,
+# which no longer finds the old name.  Fix 11 turns the crash into an empty slot, but the ship loses its LADAR (and
+# anything wired to it).  The lookup now treats the two old ids as aliases of the new ones, so old saves load with
+# their LADAR in place and nothing needs to be edited by hand.  Saves written afterwards use the new ids.
+#
+# The identifier is passed by value (a 16-byte inline buffer at [ebp+8], length at [ebp+0x18], capacity at [ebp+0x1c];
+# the callee pops it with `ret 0x18`), so a cave at the top of the loop rewrites the caller's own temporary copy in
+# place when it is a 10-character inline string equal to one of the old ids -- no allocation, no other state touched.
+# Everything else (every other module, every other caller, any other length) goes straight through.  Client and
+# server.  tools/save/test_module_alias.py runs the real lookup under emulation.
+# ============================================================
+
+def fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Saves with a LADAR load again after the BUG-018 id rename" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    HOOK = 0x004A802A if server else 0x004A815A
+    BACK = HOOK + 7
+    # mov ebx,[ebp+8] ; push esi ; mov ecx,[eax+0xc]   -- inside GameData::getModuleClassWithIdentifier
+    if verify_site(data, pe, HOOK, bytes.fromhex("8B5D08568B480C"), label) is None \
+            or verify_site(data, pe, HOOK - 0x0A, bytes.fromhex("558BEC51A1"), label + " (entry)") is None:
+        return bail(label, cave_cursor, server)
+    c = bytearray()
+    jumps = []                                                      # (position of rel8, label name)
+
+    def emit(b):
+        c.extend(b)
+
+    def jcc(op, name):
+        jumps.append((len(c) + 1, name))
+        emit(bytes([op, 0]))
+
+    emit(bytes.fromhex("837D1C0F")); jcc(0x77, "done")              # cmp [ebp+0x1c],0xf ; ja done   (heap string)
+    emit(bytes.fromhex("837D180A")); jcc(0x75, "done")              # cmp [ebp+0x18],10 ; jne done
+    emit(bytes.fromhex("817D08") + b"mkxl"); jcc(0x75, "done")      # cmp dword [ebp+8],"mkxl"
+    emit(bytes.fromhex("817D0C") + b"adar"); jcc(0x75, "done")      # cmp dword [ebp+0xc],"adar"
+    emit(bytes.fromhex("0FB74D10"))                                 # movzx ecx,word [ebp+0x10]
+    emit(bytes.fromhex("6681F9") + b"a2"); jcc(0x74, "id2")         # cmp cx,"a2" ; je id2
+    emit(bytes.fromhex("6681F9") + b"at"); jcc(0x75, "done")        # cmp cx,"at" ; jne done
+    emit(bytes.fromhex("C7450C") + b"adrt"); jcc(0xEB, "fix")       # [ebp+0xc]="adrt" ; jmp fix
+    labels = {"id2": len(c)}
+    emit(bytes.fromhex("C7450C") + b"adr2")                         # id2: [ebp+0xc]="adr2"
+    labels["fix"] = len(c)
+    emit(bytes.fromhex("C6451000"))                                 # fix: byte [ebp+0x10]=0   -> "mkxladr2"/"mkxladrt"
+    emit(bytes.fromhex("C7451808000000"))                           # length = 8
+    labels["done"] = len(c)
+    emit(bytes.fromhex("8B5D08568B480C"))                           # the displaced instructions
+    cave_va = ptch_va + cave_cursor
+    emit(b"\xE9" + _rel32(cave_va, len(c), BACK, 1))
+    for pos, name in jumps:
+        rel = labels[name] - (pos + 1)
+        assert 0 <= rel <= 127
+        c[pos] = rel
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c)] = c
+    neutralize_relocations(data, pe, HOOK, 7, label)
+    off = va_to_offset(pe, HOOK)
+    data[off:off + 7] = b"\xE9" + struct.pack("<i", cave_va - (HOOK + 5)) + b"\x90\x90"
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor + len(c) + (-len(c) % 4)
+
+
+# ============================================================
+# Fix 38: weapon spin-up time goes the wrong way with efficiency.
+#
+# A launcher or gun tube's spin-up time is `spinuptime * 0.5 * efficiency/100` seconds (the 0.5 is the game's own
+# scale).  Every other timed thing in the game gets *slower* as a module's efficiency drops (reload is
+# `reload * (2 - efficiency/100)`), but here a damaged or low-efficiency weapon spun up *faster* and a boosted one
+# slower.  The fix makes the figure `spinuptime * 0.5 * (2 - efficiency/100)`, the same rule as reload: at 100% nothing
+# changes.  There are seven places that compute it (ShipModule::runLogic where the timer is started, Ship::fireWeapon,
+# doSetWeaponTarget, getTubeSpinUpPercent, getTubeSummary, getTubeAdvancedSummary and UI_WeaponTubes::render), each
+# a `call ShipModule::getEfficiencyPercent`.  All seven now call one small stub instead: it calls the real function
+# and returns 200 - efficiency (so x/100 becomes 2 - x/100), leaving every other register and the stack as the real
+# function leaves them.  Client and server.  tools/spinup/test_spinup.py runs all seven sites under emulation.
+# ============================================================
+
+SPINUP_SITES = {
+    False: (0x4AF43D, 0x510400, 0x4E3D40, 0x4ECC13, 0x4F0F8C, 0x4F1553, 0x590360),
+    True: (0x4AF2ED, 0x50FCA0, 0x4E3830, 0x4EC673, 0x4F09FC, 0x4F0FC3, 0x58E630),
+}
+
+
+def fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=False):
+    label = "Weapon spin-up time grows as efficiency drops, like reload" + (" (server)" if server else "")
+    applied, skipped = _fix_lists(server)
+    sites = SPINUP_SITES[bool(server)]
+    targets = set()
+    for va in sites:
+        if verify_site(data, pe, va, bytes([0xE8]), label + f" (call at {va:#x})") is None:
+            return bail(label, cave_cursor, server)
+        targets.add(_rel32_target(data, pe, va, 1))
+    if len(targets) != 1:
+        print(f"  [SKIP] {label}: the seven sites do not call the same function")
+        return bail(label, cave_cursor, server)
+    GET_EFF = targets.pop()
+    cave_va = ptch_va + cave_cursor
+    stub = bytearray(b"\xE8" + _rel32(cave_va, 0, GET_EFF, 1))      # call ShipModule::getEfficiencyPercent
+    stub += bytes.fromhex("F7D8" "05C8000000" "C3")                   # neg eax ; add eax,200 ; ret
+    stub += b"\x90" * (-len(stub) % 4)
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(stub)] = stub
+    for va in sites:
+        off = va_to_offset(pe, va)
+        data[off + 1: off + 5] = struct.pack("<i", cave_va - (va + 5))
+    print(f"  [OK] {label}")
+    applied.append(label)
+    return cave_cursor + len(stub)
+
+
+# ============================================================
+# Fix 39: two shop / mechanic stat labels that mislead.
+#
+#  * Sensor suites list a "Strength" rating.  It is the module's emission sensitivity (how faint an emission it can
+#    pick up; the same value the developers called `strength`), not signal strength or power, so players read it as
+#    the wrong thing.  Relabelled "Detect Rng" (how far out it picks up emissions).
+#  * A grappling arm lists "Speed : N", but N is how long a use takes, so a LOWER number is the quicker arm -- the
+#    opposite of how every other "Speed"/"Rot. Speed" line reads.  Relabelled "Use Time".
+# Both are same-length replacements of the format strings in .rdata (referenced by one `push` each in the shop text
+# builder), so no code changes.  Only the label text changes, not the value or its colour.  Client only.
+# tools/ui/test_shop_labels.py checks the strings and their references.
+# ============================================================
+
+SHOP_LABELS = (
+    # (VA of the format string, original, replacement)
+    (0x0060E264, b"`7Strength  : %s\n", b"`7Detect Rng: %s\n"),
+    (0x0060E134, b"`7Speed     : `!%.0f\n", b"`7Use Time  : `!%.0f\n"),
+)
+
+
+def fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop stat labels: sensor 'Strength' -> 'Detect Rng', grappling arm 'Speed' -> 'Use Time'"
+    for va, old, new in SHOP_LABELS:
+        assert len(old) == len(new)
+        if verify_site(data, pe, va, old + b"\x00", label) is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    for va, old, new in SHOP_LABELS:
+        off = va_to_offset(pe, va)
+        data[off:off + len(new)] = new
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
+# ============================================================
+# Fix 40: the mechanic/shop's jump-drive "Range" rating is useless: every drive reads "V. Bad" or "Bad".
+#
+# The rating compares the drive's `jumpdistance` (class+0x104) with fixed cut-offs 240 / 280 / 300 / 360 (V. Bad below
+# 240, Bad below 280, Medium below 300, Good below 360, otherwise V. Good), but the game's nine jump drives span only
+# 160 to 260, so seven are "V. Bad" and two are "Bad".  The cut-offs are now 180 / 205 / 225 / 245, which spreads the
+# nine drives 1 / 2 / 3 / 1 / 2 across V. Bad .. V. Good (DVJD-400 V. Bad; DVJD-450 and -500 Bad; DVJD-600, KIJD-140R and
+# -140S Medium; KIJD-140 Good; KIJD-10 and -20 V. Good).  The four `comiss xmm0,[constant]` are shared constants (360.0
+# is also an angle wrap), so they cannot be edited in place; each one becomes a `call` to a four-instruction stub in
+# the cave that compares against its own constant (PIC, so no relocation entry is needed; POP and RET keep the flags
+# that the compare set).  Client only.  tools/ui/test_jump_range_rating.py runs the four compares under emulation.
+# ============================================================
+
+JUMP_RANGE_SITES = ((0x0049441A, 360.0, 245.0), (0x0049442B, 300.0, 225.0), (0x0049443C, 280.0, 205.0),
+                    (0x0049444D, 240.0, 180.0))
+
+
+def fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop jump-drive Range rating spread across the real drives (160-260)"
+    consts = {}
+    for va, old, _ in JUMP_RANGE_SITES:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if got != old:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    cave = bytearray()
+    for va, old, new in JUMP_RANGE_SITES:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1                    # the float follows comiss, pop eax, ret
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        assert len(stub) == 20
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
+# Fix 41: the shop's solar-wing "Range" rating is "Bad" for every solar wing (and "V. Bad" can never appear).
+#
+# Cut-offs on the wing's `range` (class+0x104): below 0 V. Bad (never), below 1.4 Bad, below 1.6 Medium, below 1.8 Good,
+# otherwise V. Good.  The four solar wings have a range of 1.05 to 1.35, all "Bad".  The cut-offs are now 1.1 / 1.15 /
+# 1.28 / 1.4: SLSP AE (1.05) V. Bad, SLSP (1.2) Medium, E SOLAR and E SOLAR MK 2 (1.35) Good.  (Gen. Rate already spreads
+# Bad to V. Good over the real wings and is untouched.)  Same technique as Fix 40: three of the compares are `comiss
+# xmm0,[shared constant]` and become a call to a cave stub with its own constant; the last is `comiss xmm0,xmm1 ; jb`
+# (zero in XMM1), 5 bytes, replaced by a call to a stub that makes the same decision and returns to the same two places.
+# Client only.  tools/ui/test_solar_range_rating.py runs all four compares under emulation.
+# ============================================================
+
+SOLAR_RANGE_SITES = ((0x00494548, 1.8, 1.4), (0x00494559, 1.6, 1.28), (0x0049456A, 1.4, 1.15))
+SOLAR_RANGE_LAST = (0x0049457B, 1.1)               # comiss xmm0,xmm1 ; jb 0x494588   (falls through to 0x494580)
+
+
+def fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Shop solar-wing Range rating spread across the real wings (1.05-1.35)"
+    for va, old, _ in SOLAR_RANGE_SITES:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if abs(got - old) > 1e-6:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    last_va, last_new = SOLAR_RANGE_LAST
+    if verify_site(data, pe, last_va, bytes.fromhex("0F2FC17208FF3590FA5D00"), label + " (zero compare)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    cave = bytearray()
+    for va, _, new in SOLAR_RANGE_SITES:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    cave_va = ptch_va + cave_cursor + len(cave)
+    stub = bytearray(bytes.fromhex("50" "E800000000" "58"))
+    pop_va = cave_va + len(stub) - 1
+    const_va = cave_va + 23
+    stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)       # comiss xmm0,[eax+delta]
+    stub += bytes.fromhex("58")                                                  # pop eax (flags kept)
+    stub += bytes.fromhex("7201" "C3")                                           # jb below ; ret  -> falls through to +5
+    stub += bytes.fromhex("83042408" "C3")                                       # below: add [esp],8 ; ret -> 0x494588
+    stub += struct.pack("<f", last_new)
+    assert len(stub) == 27 and len(stub) - 4 == 23
+    cave += stub
+    off = va_to_offset(pe, last_va)
+    data[off:off + 5] = b"\xE8" + struct.pack("<i", cave_va - (last_va + 5))
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
+
+
+# ============================================================
+# Fix 42: the sensor-suite page of the shop/mechanic.
+#
+#  * "Range : 0Gm" is printed from a field sensors never fill in (class+0x108), so every sensor reads 0Gm.  The line is
+#    dropped for sensors by pointing its one `push` at an empty string (the same format string is still used, with real
+#    values, by the other module types that print a range).
+#  * "Detect Rng" (sensorquality, class+0xE4) was rated against 0.8 / 1.0 / 1.2 / 1.4, but the real sensors span 0.4 to
+#    1.3, so none ever reached "V. Good" (only the Remora's RM-SNS at 5 did).  Cut-offs are now 0.55 / 0.75 / 0.95 / 1.15,
+#    which spreads the eleven sensors 1 / 2 / 3 / 3 / 2 across V. Bad .. V. Good.
+#  * "Sns. Ghsts" is rated from the `ghosttimer` dice (NdM+K as count * ((sides+1)/2) + K; a longer timer means fewer
+#    ghosts, rated Low) against 90 / 115 / 135 / 170, but the real sensors work out to 190-385, so every one read "V. Low"
+#    while the Probe Sensor (about 72) read "V. High".  Cut-offs are now 180 / 220 / 250 / 300: Probe Sensor V. High, D2/D4
+#    High, C1/C5 Moderate, SL/SM/SQ/RM Low, T0/M1/M2/T9 V. Low.
+# The compares are `comiss xmm0,[shared constant]`; as in Fix 40 each becomes a call to a cave stub with its own constant.
+# Client only.  tools/ui/test_sensor_ratings.py runs the compares under emulation.
+# ============================================================
+
+SENSOR_GHOST_SITES = ((0x00493D34, 170.0, 300.0), (0x00493D45, 135.0, 250.0), (0x00493D56, 115.0, 220.0),
+                      (0x00493D67, 90.0, 180.0))
+SENSOR_DETECT_SITES = ((0x00493FA2, 1.4, 1.15), (0x00493FB3, 1.2, 0.95), (0x00493FC4, 1.0, 0.75), (0x00493FD5, 0.8, 0.55))
+SENSOR_RANGE_PUSH, SENSOR_RANGE_STRING, EMPTY_STRING = 0x00493CBC, 0x0060E0F4, 0x0060E275
+
+
+def fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Sensor page: no bogus Range line, Detect Rng and Sns. Ghsts ratings spread over the real sensors"
+    sites = SENSOR_GHOST_SITES + SENSOR_DETECT_SITES
+    for va, old, _ in sites:
+        off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
+        if off is None:
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+        addr = struct.unpack_from("<I", data, off + 3)[0]
+        got = struct.unpack("<f", data[va_to_offset(pe, addr):va_to_offset(pe, addr) + 4])[0]
+        if abs(got - old) > 1e-5:
+            print(f"  [SKIP] {label}: constant at {addr:#x} is {got}, expected {old}")
+            FIXES_SKIPPED.append(label)
+            return cave_cursor
+    if verify_site(data, pe, SENSOR_RANGE_PUSH, bytes([0x68]) + struct.pack("<I", SENSOR_RANGE_STRING), label + " (Range push)") is None \
+            or verify_site(data, pe, EMPTY_STRING, b"\x00\x00\x00", label + " (empty string)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    cave = bytearray()
+    for va, _, new in sites:
+        cave_va = ptch_va + cave_cursor + len(cave)
+        stub = bytearray(bytes.fromhex("50" "E800000000" "58"))        # push eax ; call $+5 ; pop eax
+        pop_va = cave_va + len(stub) - 1
+        const_va = cave_va + len(stub) + 7 + 1 + 1
+        stub += bytes.fromhex("0F2F80") + struct.pack("<i", const_va - pop_va)   # comiss xmm0,[eax+delta]
+        stub += bytes.fromhex("58" "C3") + struct.pack("<f", new)     # pop eax ; ret ; the constant
+        cave += stub
+        neutralize_relocations(data, pe, va, 7, label)
+        off = va_to_offset(pe, va)
+        data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
+    # the sensor's Range line: same push, empty format string (the operand keeps its base-relocation entry)
+    off = va_to_offset(pe, SENSOR_RANGE_PUSH + 1)
+    data[off:off + 4] = struct.pack("<I", EMPTY_STRING)
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor + len(cave)
 
 
 # ============================================================
@@ -2704,6 +3136,66 @@ def fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor):
     return cave_cursor
 
 
+# ============================================================
+# Fix 34: Options > resolution takes several clicks per visible change (Issue #61).
+# OISConfiguration::configure() builds `validResolutions` by looping over
+# EnumDisplaySettingsW(NULL, i, &devmode) and appending every mode's
+# (dmPelsWidth, dmPelsHeight).  Windows returns one mode per refresh rate (and
+# per colour depth), so 1920x1080 at 60/75/100/120/144 Hz is five identical list
+# entries, and every click on the resolution selector only moves one entry along.
+# Fix: before appending a mode, scan the entries added so far and skip it if the
+# same width x height is already in the list (the first occurrence is kept).  The
+# saved setting is a "WxH" string that load() looks up in the list, so existing
+# config files keep working.  Client only (the server has no display list).
+# ============================================================
+
+def fix_resolution_list_duplicates(data, pe, ptch_va, ptch_off, cave_cursor):
+    label = "Resolution setting: one click per distinct resolution (duplicate refresh-rate modes removed)"
+    SITE, SKIP_APPEND, GO_APPEND = 0x004B0B47, 0x004B0B6A, 0x004B0B4D
+    LIST_VA = 0x0065D760                                   # validResolutions: _Myfirst, _Mylast (+4), _Myend (+8)
+    # CMP [_Myend],EAX / JE realloc  ...  LEA EAX,[EBP-0xE0] (the loop's next EnumDisplaySettingsW call)
+    if verify_site(data, pe, SITE, bytes.fromhex("3905" "68D76500" "740E"), label) is None \
+            or verify_site(data, pe, SKIP_APPEND, bytes.fromhex("8D8520FFFFFF"), label + " (loop continue)") is None \
+            or verify_site(data, pe, SITE - 0x12, bytes.fromhex("8B4DCC8B55D0"), label + " (width/height loads)") is None:
+        FIXES_SKIPPED.append(label)
+        return cave_cursor
+    neutralize_relocations(data, pe, SITE, 6, label)
+    cave_va = ptch_va + cave_cursor
+    c = bytearray()
+    # On entry (from inside the loop): EAX = _Mylast, ECX = width, EDX = height, ESI = mode index, EDI = EnumDisplaySettingsW
+    c += bytes.fromhex("53")                                       # PUSH EBX
+    c += bytes.fromhex("E800000000" "5B")                          # CALL $+5 ; POP EBX  (position independent)
+    pop_va = cave_va + len(c) - 1                                  # address of the POP, which is what EBX now holds
+    c += bytes.fromhex("81C3") + struct.pack("<i", LIST_VA - pop_va)   # ADD EBX,<delta>  -> EBX = &validResolutions
+    c += bytes.fromhex("56")                                       # PUSH ESI (it is the loop's mode index)
+    c += bytes.fromhex("8B33")                                     # MOV ESI,[EBX]      first entry
+    scan = len(c)
+    c += bytes.fromhex("3BF0")                                     # scan: CMP ESI,EAX  (reached _Mylast?)
+    jae = len(c) + 1; c += b"\x73\x00"                             # JAE not_found
+    c += bytes.fromhex("390E")                                     # CMP [ESI],ECX      same width?
+    jne = len(c) + 1; c += b"\x75\x00"                             # JNE next
+    c += bytes.fromhex("395604")                                   # CMP [ESI+4],EDX    same height?
+    je = len(c) + 1; c += b"\x74\x00"                              # JE found
+    c[jne] = len(c) - (jne + 1)
+    c += bytes.fromhex("83C608")                                   # next: ADD ESI,8
+    c += b"\xEB" + bytes([(scan - (len(c) + 2)) & 0xFF])           # JMP scan
+    c[jae] = len(c) - (jae + 1)
+    c += bytes.fromhex("5E")                                       # not_found: POP ESI
+    c += bytes.fromhex("394308")                                   # CMP [EBX+8],EAX   (the displaced "CMP [_Myend],EAX")
+    c += bytes.fromhex("5B")                                       # POP EBX           (POP keeps the flags for the JE)
+    c += b"\xE9" + _rel32(cave_va, len(c), GO_APPEND, 1)           # JMP back to the original JE realloc
+    c[je] = len(c) - (je + 1)
+    c += bytes.fromhex("5E" "5B")                                  # found: POP ESI / POP EBX
+    c += b"\xE9" + _rel32(cave_va, len(c), SKIP_APPEND, 1)         # JMP past the append: duplicate, not added
+    data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(c)] = c
+    cave_cursor += len(c)
+    off = va_to_offset(pe, SITE)
+    data[off:off + 6] = b"\xE9" + struct.pack("<i", cave_va - (SITE + 5)) + b"\x90"
+    print(f"  [OK] {label}")
+    FIXES_APPLIED.append(label)
+    return cave_cursor
+
+
 def fix_pirate_hunt_server(data, pe, ptch_va, ptch_off, cave_cursor):
     label = "Pirate Hunt crash guard (server)"
     PATCH_SITE_VA, RESUME_VA, LOOP_EXIT_VA = 0x00408947, 0x0040894d, 0x004089d3
@@ -2833,14 +3325,14 @@ def patch_server_exe(exe_path):
     cave_cursor = fix_pds_torpedoes(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
+    cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
 
-    # --- PLUGIN HOOK ---
-    try:
-        import personal_variants
-        cave_cursor = personal_variants.apply_exe_fixes(data, pe, ptch_va, ptch_off, cave_cursor, server=True)
-    except ImportError:
-        pass
+    # --- PLUGIN HOOK (the user already chose variants in begin_run) ---
+    cave_cursor = _plugin_call("apply_exe_fixes", data, pe, ptch_va, ptch_off, cave_cursor,
+                               server=True, default=cave_cursor)
     # -------------------
     pe.close()
 
@@ -3428,6 +3920,144 @@ def restore_news_info(game_dir, keep_backup=False):
     return True
 
 
+# ============================================================
+# Optional DLL refresh (dll_update.py, a port of OIS-Update's Patch_OIS.bat)
+#
+# The game ships with 2018-era libraries (OpenAL, curl, zlib, libtiff, ...). The OIS-Update package
+# (github.com/Voidless7125/OIS-Update) has newer builds of them. This step is always optional and always asked:
+#   - an OIS-Update folder found next to this script, in or beside the game folder, or named by
+#     %OIS_UPDATE_DIR%  -> "update the DLLs from it?"
+#   - none found          -> "download it and update the DLLs?"  (about 25 MB, every file checked against the
+#     package's own SHA256 manifest before it is used)
+# --yes alone never opts in (it would otherwise download and replace libraries unattended); --dll-update does,
+# --no-dll-update never asks. The copy happens after the exe and data fixes, so a failed exe patch never leaves
+# half an update behind. The firewall rules, repair shortcut and install ping of Patch_OIS.bat are left out.
+# ============================================================
+
+_DLL = {"pkg": None, "go": False, "result": None}
+
+
+def _dll_module():
+    try:
+        import dll_update
+    except ModuleNotFoundError as e:
+        if e.name != "dll_update":
+            raise
+        return None
+    return dll_update
+
+
+def _dll_current(du, game_dir, pkg):
+    return all((game_dir / n).is_file() and du.sha256_file(game_dir / n) == s for n, s in pkg.game)
+
+
+def dll_begin(game_dir, mode=None):
+    """Asks (once, before anything is patched) and, on yes, gets a verified package. `mode` is None to ask,
+    True for --dll-update, False for --no-dll-update. Never raises: a problem here only skips the DLL step."""
+    _DLL.update(pkg=None, go=False, result=None)
+    du = _dll_module()
+    if du is None or mode is False:
+        return
+    game_dir = Path(game_dir)
+    try:
+        du.add_search_dir(game_dir)
+        pkg = du.find_local_package()
+        if pkg is not None:
+            missing, bad = du.check_package(pkg)
+            if not missing and not bad and _dll_current(du, game_dir, pkg):
+                print(f"\nGame DLLs: already match OIS-Update {pkg.version}; nothing to do.")
+                return
+            if missing or bad:
+                print(f"\nGame DLLs: the OIS-Update folder at {pkg.root} is incomplete or altered "
+                      f"({len(missing)} missing, {len(bad)} with the wrong SHA256).")
+                pkg = None
+            else:
+                print(f"\nGame DLLs: OIS-Update {pkg.version} found at {pkg.root}.")
+        if pkg is None and not mode and (du.load_state(game_dir) or du.read_installed_manifest(game_dir)):
+            return        # already updated earlier and no package on disk: don't nag on every run
+        if pkg is None:
+            print("\nGame DLLs: the game ships with 2018 libraries; OIS-Update has newer ones.")
+            question = ("  Download OIS-Update (about 25 MB, from github.com/Voidless7125/OIS-Update) and update "
+                        "the game's DLLs?")
+        else:
+            question = "  Update the game's DLLs from it?"
+        print("  Originals are backed up to oisbugfix_original_dlls/ and put back by --uninstall; "
+              "every file is checked against the package's SHA256 manifest.")
+        if mode:
+            go = True
+        elif sys.stdin.isatty():
+            try:
+                go = input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                go = False
+        else:
+            print("  [SKIP] Not an interactive session; add --dll-update to do this unattended.")
+            go = False
+        if not go:
+            return
+        if pkg is None:
+            print("  Getting the package...")
+            pkg = du.obtain_package()
+            if pkg is None:
+                print("  [SKIP] No usable package, so the DLLs will not be touched. (The other fixes go ahead.)")
+                return
+        _DLL.update(pkg=pkg, go=True)
+    except Exception as e:                       # network, disk, anything: never take the patch down with it
+        print(f"  [SKIP] DLL update unavailable: {e}")
+        _DLL.update(pkg=None, go=False)
+
+
+def dll_apply(game_dir):
+    if not _DLL["go"]:
+        return
+    du = _dll_module()
+    print("\nUpdating the game's DLLs...")
+    try:
+        ok = bool(du.install(Path(game_dir), package=_DLL["pkg"]))
+    except Exception as e:
+        print(f"      [ERROR] {e}")
+        ok = False
+    _DLL["result"] = ok
+    print(f"  [{'OK' if ok else 'FAILED'}] DLL update"
+          + ("" if ok else " (see above; the exe and data fixes are unaffected)"))
+
+
+def dll_summary_lines():
+    if not _DLL["go"]:
+        return []
+    return [f"DLL update: {'applied' if _DLL['result'] else 'FAILED, see above'}"]
+
+
+def dll_status_lines(game_dir):
+    du = _dll_module()
+    if du is None:
+        return []
+    game_dir = Path(game_dir)
+    du.add_search_dir(game_dir)
+    lines = list(du.status_lines(game_dir))
+    pkg = du.find_local_package()
+    if pkg is not None and not any(du.check_package(pkg)) and not _dll_current(du, game_dir, pkg):
+        lines.append(f"  {'':<16} OIS-Update {pkg.version} is on disk at {pkg.root}; run the patcher to apply it")
+    return lines
+
+
+def dll_uninstall_plan(game_dir):
+    du = _dll_module()
+    if du is None:
+        return []
+    du.add_search_dir(game_dir)
+    return du.uninstall_plan(game_dir)
+
+
+def dll_uninstall(game_dir, keep_backups=False):
+    du = _dll_module()
+    if du is None:
+        return True
+    du.add_search_dir(game_dir)
+    return bool(du.uninstall(Path(game_dir), keep_backups))
+
+
 def print_status(game_dir):
     game_dir = Path(game_dir)
     print(f"Install: {game_dir}")
@@ -3448,6 +4078,10 @@ def print_status(game_dir):
     print(f"  {'bugfix mod':<16} {'installed at ' + str(mod_dir) if mod_dir.is_dir() else 'not installed'}")
     n = len(saved_originals(game_dir))
     print(f"  {'news/info text':<16} {f'{n} article(s) corrected in place; originals in {ORIGINALS_DIRNAME}/' if n else 'not modified'}")
+    for line in dll_status_lines(game_dir):
+        print(line)
+    for line in _plugin_call("status_lines", game_dir, default=[]) or []:
+        print(line)
 
 
 def confirm(question, assume_yes):
@@ -3496,7 +4130,9 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
     print(f"  {'news/info text':<16} "
           f"{str(len(news_saved)) + ' corrected article(s), originals saved' if news_saved else 'not modified'}")
 
-    if not restorable and not mod_present and not news_saved:
+    dll_items = dll_uninstall_plan(game_dir)
+    plugin_items = dll_items + (_plugin_call("uninstall_plan", game_dir, default=[]) or [])
+    if not restorable and not mod_present and not news_saved and not plugin_items:
         print("\nNothing installed by this script was found -- nothing to undo.")
         return True
 
@@ -3509,6 +4145,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
     if news_saved:
         print(f"  - restore {len(news_saved)} news/info article(s) in assets/ from {ORIGINALS_DIRNAME}/"
               f"{'' if keep_backups else ', then delete that folder'}")
+    for item in plugin_items:
+        print(f"  - {item}")
     print("  - leave save games, settings and every other game file untouched")
 
     if not confirm("\nProceed?", assume_yes):
@@ -3526,6 +4164,10 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
         remove_mod(game_dir)
     if news_saved:
         ok = restore_news_info(game_dir, keep_backup=keep_backups) and ok
+    if dll_items:
+        ok = dll_uninstall(game_dir, keep_backups) and ok
+    if len(plugin_items) > len(dll_items):
+        ok = bool(_plugin_call("uninstall", game_dir, keep_backups, default=True)) and ok
 
     print("\n" + "=" * 60)
     if ok:
@@ -3535,8 +4177,8 @@ def uninstall(game_dir, assume_yes=False, keep_backups=False, extra_exes=()):
               "patched and stock files; verifying the game files through Steam or GOG is the\n"
               "safest way back to a clean state.")
     print("\nNote: this only undoes what ois_patcher.py did. Anything installed by\n"
-          "Patch_OIS.bat (its own Backup folder, OIS_Update.version.txt, firewall rules)\n"
-          "is separate -- run that script with -uninstall for those.")
+          "Patch_OIS.bat itself (its own Backup folder, firewall rules) is separate --\n"
+          "run that script with -uninstall for those.")
     return ok
 
 
@@ -3867,6 +4509,11 @@ def main():
                         help="Re-patch from the backup even when the install is already current.")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Answer yes to confirmation prompts (for unattended runs).")
+    parser.add_argument("--dll-update", action="store_true",
+                        help="Also update the game's DLLs from the OIS-Update package (found on disk, "
+                             "otherwise downloaded) without asking.")
+    parser.add_argument("--no-dll-update", action="store_true",
+                        help="Do not offer the optional DLL update.")
     parser.add_argument("--update", action="store_true",
                         help="Check the git checkout for a newer patcher and apply it without "
                              "asking, then re-run.")
@@ -3876,6 +4523,7 @@ def main():
                         help="With --uninstall, leave the .original-backup files in place "
                              "instead of deleting them after a verified restore.")
     args = parser.parse_args()
+    dll_mode = True if args.dll_update else (False if args.no_dll_update else None)
 
     if args.list_installs:
         found = find_game_dirs()
@@ -3933,16 +4581,27 @@ def main():
         sys.exit(1)
 
     if action == "mod-only":
+        # exes are current: variants that live in the exe can't change now, the others can still be chosen
+        _plugin_call("begin_run", game_dir, args.yes, exe_patching=False)
+        dll_begin(game_dir, dll_mode)
         print("\nRefreshing data-only bugfix mod...")
         mod_installed = install_mod(exe_path)
         print(f"\nBugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
+        _plugin_call("post_install", game_dir)
+        dll_apply(game_dir)
+        for line in dll_summary_lines() + (_plugin_call("summary_lines", default=[]) or []):
+            print(line)
         print("Exe fixes: already up to date, nothing changed.")
         sys.exit(0)
 
-    print(f"\nPatching: {exe_path}")
-
     if not ensure_writable([exe_path, game_dir / "ois_server.exe"]):
         sys.exit(1)
+
+    # Optional personal variants (personal_variants.py): asked one at a time, before anything is patched.
+    _plugin_call("begin_run", game_dir, args.yes)
+    dll_begin(game_dir, dll_mode)
+
+    print(f"\nPatching: {exe_path}")
 
     # Read and validate first. Writing a backup of a file that turns out
     # not to be patchable leaves confusing litter in the game folder and
@@ -4011,18 +4670,24 @@ def main():
     cave_cursor = fix_forced_conversation_first_option(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_news_enter_without_selection(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_pds_panel_name_overflow(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_pds_hit_chance_label(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_overshoot(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_autopilot_cruise_burn(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_autopilot_overshoot_stop(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_module_id_alias(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_weapon_spinup(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_shop_stat_labels(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_jump_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_behaviour_uninitialised_stealth(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_nav_jump_range_efficiency(data, pe, ptch_va, ptch_off, cave_cursor)
     cave_cursor = fix_station_to_ship_crash(data, pe, ptch_va, ptch_off, cave_cursor)
+    cave_cursor = fix_resolution_list_duplicates(data, pe, ptch_va, ptch_off, cave_cursor)
 
     # --- PLUGIN HOOK ---
-    try:
-        import personal_variants
-        cave_cursor = personal_variants.apply_exe_fixes(data, pe, ptch_va, ptch_off, cave_cursor, server=False)
-    except ImportError:
-        pass
+    cave_cursor = _plugin_call("apply_exe_fixes", data, pe, ptch_va, ptch_off, cave_cursor,
+                               server=False, default=cave_cursor)
     # -------------------
     pe.close()
 
@@ -4038,6 +4703,9 @@ def main():
     print("\nInstalling data-only bugfix mod...")
     mod_installed = install_mod(exe_path)
 
+    _plugin_call("post_install", game_dir)
+    dll_apply(game_dir)
+
     print(f"\n{'='*60}")
     print(f"Applied {len(FIXES_APPLIED)} exe fix(es), skipped {len(FIXES_SKIPPED)}.")
     if FIXES_SKIPPED:
@@ -4049,6 +4717,8 @@ def main():
     else:
         print("ois_server.exe: not patched, see above (only matters for hosting/joining co-op games).")
     print(f"Bugfix mod: {'installed' if mod_installed else 'skipped, see above'}")
+    for line in dll_summary_lines() + (_plugin_call("summary_lines", default=[]) or []):
+        print(line)
     print(f"\nPatched: {exe_path}")
     print(f"Original backed up at: {backup_path}")
     print("To undo everything (exe(s) restored, mod removed):")
