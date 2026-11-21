@@ -2924,11 +2924,15 @@ def fix_solar_range_rating(data, pe, ptch_va, ptch_off, cave_cursor):
 SENSOR_GHOST_SITES = ((0x00493D34, 170.0, 300.0), (0x00493D45, 135.0, 250.0), (0x00493D56, 115.0, 220.0),
                       (0x00493D67, 90.0, 180.0))
 SENSOR_DETECT_SITES = ((0x00493FA2, 1.4, 1.15), (0x00493FB3, 1.2, 0.95), (0x00493FC4, 1.0, 0.75), (0x00493FD5, 0.8, 0.55))
-SENSOR_RANGE_PUSH, SENSOR_RANGE_STRING, EMPTY_STRING = 0x00493CBC, 0x0060E0F4, 0x0060E275
+SENSOR_RANGE_PUSH, SENSOR_RANGE_STRING = 0x00493CBC, 0x0060E0F4
+# the Range line's argument set-up, replaced by "load softwareversion (class +0xB0) as the %d argument"
+SENSOR_RANGE_ARGS = 0x00493CA6
+SENSOR_RANGE_ARGS_OLD = bytes.fromhex("F30F108108010000" "8D45D8" "0F5AC0" "83EC08" "F20F110424")   # 22 bytes
+SENSOR_VERSION_FMT = b"`7Soft. Ver.: `!%d\n\x00"
 
 
 def fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor):
-    label = "Sensor page: no bogus Range line, Detect Rng and Sns. Ghsts ratings spread over the real sensors"
+    label = "Sensor page: software version instead of the bogus Range line, Detect Rng and Sns. Ghsts ratings spread over the real sensors"
     sites = SENSOR_GHOST_SITES + SENSOR_DETECT_SITES
     for va, old, _ in sites:
         off = verify_site(data, pe, va, bytes.fromhex("0F2F05"), label)
@@ -2942,7 +2946,7 @@ def fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor):
             FIXES_SKIPPED.append(label)
             return cave_cursor
     if verify_site(data, pe, SENSOR_RANGE_PUSH, bytes([0x68]) + struct.pack("<I", SENSOR_RANGE_STRING), label + " (Range push)") is None \
-            or verify_site(data, pe, EMPTY_STRING, b"\x00\x00\x00", label + " (empty string)") is None:
+            or verify_site(data, pe, SENSOR_RANGE_ARGS, SENSOR_RANGE_ARGS_OLD, label + " (Range arguments)") is None:
         FIXES_SKIPPED.append(label)
         return cave_cursor
     cave = bytearray()
@@ -2957,10 +2961,17 @@ def fix_sensor_ratings(data, pe, ptch_va, ptch_off, cave_cursor):
         neutralize_relocations(data, pe, va, 7, label)
         off = va_to_offset(pe, va)
         data[off:off + 7] = b"\xE8" + struct.pack("<i", cave_va - (va + 5)) + b"\x90\x90"
+    # the sensor's Range line becomes "Soft. Ver.: <softwareversion>": the argument is the int at class+0xB0 instead of
+    # the float at +0x108 widened to a double (the 8-byte argument slot stays), and the format string is ours.
+    # The push operand keeps its base-relocation entry, so pointing it into the cave is fine.
+    fmt_va = ptch_va + cave_cursor + len(cave)
+    cave += SENSOR_VERSION_FMT
     data[ptch_off + cave_cursor: ptch_off + cave_cursor + len(cave)] = cave
-    # the sensor's Range line: same push, empty format string (the operand keeps its base-relocation entry)
+    neutralize_relocations(data, pe, SENSOR_RANGE_ARGS, len(SENSOR_RANGE_ARGS_OLD), label)
+    off = va_to_offset(pe, SENSOR_RANGE_ARGS)
+    data[off:off + 22] = bytes.fromhex("8B91B0000000" "8D45D8" "83EC08" "891424") + b"\x90" * 7
     off = va_to_offset(pe, SENSOR_RANGE_PUSH + 1)
-    data[off:off + 4] = struct.pack("<I", EMPTY_STRING)
+    data[off:off + 4] = struct.pack("<I", fmt_va)
     print(f"  [OK] {label}")
     FIXES_APPLIED.append(label)
     return cave_cursor + len(cave)
