@@ -322,6 +322,21 @@ FIXES = {
         (1, "    basevalue=2505\n", "    basevalue=0\n"),
     ],
 
+    # The mechanic's Modules page prints its status text in a 146 x 199 pane that starts at y=57, and the Buy/Sell
+    # Module button sat at y=209.  With a long stat list plus "No free <slot> slot for module." and "Cannot afford this
+    # module." (which wraps to two lines) the text ran under the button.  The button moves to y=221, the row the Pods page's
+    # Sell Pod and the Repair button already use.
+    "ui_x7.txt": [
+        (1, "    button=208,209,72,`%Buy Module,MECHANIC_MODULETRANSACTION,MECHANIC_CAN_BUY_MODULE",
+            "    button=208,221,72,`%Buy Module,MECHANIC_MODULETRANSACTION,MECHANIC_CAN_BUY_MODULE"),
+        (1, "    greyedbutton=208,209,72,Buy Module,NONE,MECHANIC_CANNOT_BUY_MODULE",
+            "    greyedbutton=208,221,72,Buy Module,NONE,MECHANIC_CANNOT_BUY_MODULE"),
+        (1, "    button=208,209,72,`%Sell Module,MECHANIC_MODULETRANSACTION,MECHANIC_CAN_SELL_MODULE",
+            "    button=208,221,72,`%Sell Module,MECHANIC_MODULETRANSACTION,MECHANIC_CAN_SELL_MODULE"),
+        (1, "    greyedbutton=208,209,72,Sell Module,NONE,MECHANIC_CANNOT_SELL_MODULE",
+            "    greyedbutton=208,221,72,Sell Module,NONE,MECHANIC_CANNOT_SELL_MODULE"),
+    ],
+
 
     # BUG-036 (GitHub issue #25): on the Enceladus, the airlock door
     # buttons' invisible click boxes (ColliderCube children with
